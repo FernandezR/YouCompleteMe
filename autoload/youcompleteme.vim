@@ -1,4 +1,4 @@
-" Copyright (C) 2011, 2012  Google Inc.
+" Copyright (C) 2011-2018 YouCompleteMe contributors
 "
 " This file is part of YouCompleteMe.
 "
@@ -19,38 +19,107 @@
 let s:save_cpo = &cpo
 set cpo&vim
 
+" NOTE: Neovim reports v:version as 800, which is garbage. For some features
+" that are supported by our minimum Vim version, we have to guard them against
+" neovim, which doesn't implement them.
+let s:is_neovim = has( 'nvim' )
+
+" Only useful in neovim, for handling text properties... I mean extmarks.
+let g:ycm_neovim_ns_id = s:is_neovim ? nvim_create_namespace( 'ycm_id' ) : -1
+
 " This needs to be called outside of a function
 let s:script_folder_path = escape( expand( '<sfile>:p:h' ), '\' )
-let s:omnifunc_mode = 0
-
-let s:old_cursor_position = []
-let s:cursor_moved = 0
-let s:moved_vertically_in_insert_mode = 0
-let s:previous_num_chars_on_current_line = strlen( getline('.') )
-
-let s:diagnostic_ui_filetypes = {
-      \ 'cpp': 1,
-      \ 'cs': 1,
-      \ 'c': 1,
-      \ 'objc': 1,
-      \ 'objcpp': 1,
+let s:force_semantic = 0
+let s:force_manual = 0
+let s:completion_stopped = 0
+" These two variables are initialized in youcompleteme#Enable.
+let s:default_completion = {}
+let s:completion = s:default_completion
+let s:default_signature_help = {}
+let s:signature_help = s:default_completion
+let s:previous_allowed_buffer_number = 0
+let s:pollers = {
+      \   'completion': {
+      \     'id': -1,
+      \     'wait_milliseconds': 10,
+      \   },
+      \   'signature_help': {
+      \     'id': -1,
+      \     'wait_milliseconds': 10,
+      \   },
+      \   'file_parse_response': {
+      \     'id': -1,
+      \     'wait_milliseconds': 100,
+      \   },
+      \   'server_ready': {
+      \     'id': -1,
+      \     'wait_milliseconds': 100,
+      \   },
+      \   'receive_messages': {
+      \     'id': -1,
+      \     'wait_milliseconds': 100,
+      \   },
+      \   'command': {
+      \     'id': -1,
+      \     'wait_milliseconds': 100,
+      \     'requests': {},
+      \   },
+      \   'semantic_highlighting': {
+      \     'id': -1,
+      \     'wait_milliseconds': 100,
+      \   },
+      \   'inlay_hints': {
+      \     'id': -1,
+      \     'wait_milliseconds': 100,
+      \   },
       \ }
+let s:buftype_blacklist = {
+      \   'help': 1,
+      \   'terminal': 1,
+      \   'quickfix': 1,
+      \   'popup': 1,
+      \   'nofile': 1,
+      \ }
+let s:last_char_inserted_by_user = v:true
+let s:enable_hover = 0
+let s:cursorhold_popup = -1
+let s:enable_inlay_hints = 0
+
+let s:force_preview_popup = 0
+
+let s:RESOLVE_NONE = 0
+let s:RESOLVE_UP_FRONT = 1
+let s:RESOLVE_ON_DEMAND = 2
+let s:resolve_completions = s:RESOLVE_NONE
+
+function! s:StartMessagePoll()
+  if s:pollers.receive_messages.id < 0
+    let s:pollers.receive_messages.id = timer_start(
+          \ s:pollers.receive_messages.wait_milliseconds,
+          \ function( 's:ReceiveMessages' ) )
+  endif
+endfunction
 
 
-function! youcompleteme#Enable()
-  " When vim is in diff mode, don't run
-  if &diff
-    return
+function! s:ReceiveMessages( timer_id )
+  let poll_again = v:false
+  if s:AllowedToCompleteInCurrentBuffer()
+    let poll_again = py3eval( 'ycm_state.OnPeriodicTick()' )
   endif
 
-  call s:SetUpBackwardsCompatibility()
-
-  " This can be 0 if YCM libs are old or -1 if an exception occured while
-  " executing the function.
-  if s:SetUpPython() != 1
-    return
+  if poll_again
+    let s:pollers.receive_messages.id = timer_start(
+          \ s:pollers.receive_messages.wait_milliseconds,
+          \ function( 's:ReceiveMessages' ) )
+  else
+    " Don't poll again until we open another buffer
+    let s:pollers.receive_messages.id = -1
   endif
+endfunction
 
+
+function! s:SetUpOptions()
+  call s:SetUpCommands()
   call s:SetUpCpoptions()
   call s:SetUpCompleteopt()
   call s:SetUpKeyMappings()
@@ -61,10 +130,61 @@ function! youcompleteme#Enable()
 
   call s:SetUpSigns()
   call s:SetUpSyntaxHighlighting()
+endfunction
 
-  if g:ycm_allow_changing_updatetime && &updatetime > 2000
-    set ut=2000
+
+function! youcompleteme#Enable()
+  call s:SetUpBackwardsCompatibility()
+
+  let completeopt = split( &completeopt, ',' )
+
+  " Will we add 'popup' to the 'completeopt' (later)
+  let s:force_preview_popup =
+        \ type( g:ycm_add_preview_to_completeopt ) == v:t_string &&
+          \ g:ycm_add_preview_to_completeopt ==# 'popup' &&
+          \ !s:is_neovim
+
+  " Will we add 'preview' to the 'completeopt' (later)
+  let force_preview =
+        \ type( g:ycm_add_preview_to_completeopt ) != v:t_string &&
+          \ g:ycm_add_preview_to_completeopt
+
+  " Will we be using the preview popup ? That is either the user set it in their
+  " completeopt or we're going to add it later.
+  let use_preview_popup =
+        \ s:force_preview_popup ||
+        \ index( completeopt, 'popup' ) >= 0
+
+  " We should only ask the server to resolve completion items upfront if we're
+  " going to display them - that is either:
+  "  - popup is (or will be) in completeopt
+  "  - preview is (or will be) in completeopt, or
+  let require_resolve =
+        \ use_preview_popup ||
+        \ force_preview ||
+        \ index( completeopt, 'preview' ) >= 0
+
+  if use_preview_popup && exists( '*popup_findinfo' )
+    " If the preview popup is going to be used, and on-demand resolve can be
+    " supported, enable it.
+    let s:resolve_completions = s:RESOLVE_ON_DEMAND
+  elseif require_resolve
+    " The preview window or info popup is enabled - request the server
+    " pre-resolves completion items
+    let s:resolve_completions = s:RESOLVE_UP_FRONT
+  else
+    " Otherwise, there's no point in resolving completions - they'll never be
+    " displayed.
   endif
+
+  if !s:SetUpPython()
+    return
+  endif
+
+  call s:SetUpOptions()
+
+  py3 ycm_semantic_highlighting.Initialise()
+  let s:enable_inlay_hints = py3eval( 'ycm_inlay_hints.Initialise()' ) ? 1 : 0
 
   call youcompleteme#EnableCursorMovedAutocommands()
   augroup youcompleteme
@@ -72,78 +192,135 @@ function! youcompleteme#Enable()
     " Note that these events will NOT trigger for the file vim is started with;
     " so if you do "vim foo.cc", these events will not trigger when that buffer
     " is read. This is because youcompleteme#Enable() is called on VimEnter and
-    " that happens *after" BufRead/BufEnter has already triggered for the
-    " initial file.
-    " We also need to trigger buf init code on the FileType event because when
-    " the user does :enew and then :set ft=something, we need to run buf init
-    " code again.
-    autocmd BufReadPre * call s:OnBufferReadPre( expand( '<afile>:p' ) )
-    autocmd BufRead,BufEnter,FileType * call s:OnBufferVisit()
-    autocmd BufUnload * call s:OnBufferUnload( expand( '<afile>:p' ) )
-    autocmd CursorHold,CursorHoldI * call s:OnCursorHold()
+    " that happens *after* FileType has already triggered for the initial file.
+    " We don't parse the buffer on the BufRead event since it would only be
+    " useful if the buffer filetype is set (we ignore the buffer if there is no
+    " filetype) and if so, the FileType event has triggered before and thus the
+    " buffer is already parsed.
+    autocmd BufWritePost,FileWritePost * call s:OnFileSave()
+    autocmd FileType * call s:OnFileTypeSet()
+    autocmd BufEnter,CmdwinEnter,WinEnter * call s:OnBufferEnter()
+    autocmd BufUnload * call s:OnBufferUnload()
     autocmd InsertLeave * call s:OnInsertLeave()
-    autocmd InsertEnter * call s:OnInsertEnter()
     autocmd VimLeave * call s:OnVimLeave()
     autocmd CompleteDone * call s:OnCompleteDone()
+    autocmd CompleteChanged * call s:OnCompleteChanged()
   augroup END
 
-  " Calling these once solves the problem of BufReadPre/BufRead/BufEnter not
-  " triggering for the first loaded file. This should be the last commands
-  " executed in this function!
-  call s:OnBufferReadPre( expand( '<afile>:p' ) )
-  call s:OnBufferVisit()
+  " The FileType event is not triggered for the first loaded file. We wait until
+  " the server is ready to manually run the s:OnFileTypeSet function.
+  let s:pollers.server_ready.id = timer_start(
+        \ s:pollers.server_ready.wait_milliseconds,
+        \ function( 's:PollServerReady' ) )
+
+  let s:default_completion = py3eval( 'vimsupport.NO_COMPLETIONS' )
+  let s:completion = s:default_completion
+
+  if s:PropertyTypeNotDefined( 'YCM-signature-help-current-argument' )
+    hi default YCMInverse term=reverse cterm=reverse gui=reverse
+    call prop_type_add( 'YCM-signature-help-current-argument', {
+          \   'highlight': 'YCMInverse',
+          \   'combine':   1,
+          \   'priority':  50,
+          \ } )
+  endif
+
+  nnoremap <silent> <plug>(YCMFindSymbolInWorkspace)
+        \ :call youcompleteme#finder#FindSymbol( 'workspace' )<CR>
+  nnoremap <silent> <plug>(YCMFindSymbolInDocument)
+        \ :call youcompleteme#finder#FindSymbol( 'document' )<CR>
 endfunction
 
 
 function! youcompleteme#EnableCursorMovedAutocommands()
-    augroup ycmcompletemecursormove
-        autocmd!
-        autocmd CursorMovedI * call s:OnCursorMovedInsertMode()
-        autocmd CursorMoved * call s:OnCursorMovedNormalMode()
-    augroup END
+  augroup ycmcompletemecursormove
+    autocmd!
+    autocmd CursorMoved * call s:OnCursorMovedNormalMode()
+    autocmd CursorMovedI * let s:current_cursor_position = getpos( '.' )
+    autocmd InsertEnter * call s:OnInsertEnter()
+    autocmd TextChanged * call s:OnTextChangedNormalMode()
+    autocmd TextChangedI * call s:OnTextChangedInsertMode( v:false )
+    autocmd TextChangedP * call s:OnTextChangedInsertMode( v:true )
+    autocmd InsertCharPre * call s:OnInsertChar()
+    if exists( '##WinScrolled' )
+      autocmd WinScrolled * call s:OnWinScrolled()
+    endif
+  augroup END
 endfunction
 
 
 function! youcompleteme#DisableCursorMovedAutocommands()
-    autocmd! ycmcompletemecursormove CursorMoved *
-    autocmd! ycmcompletemecursormove CursorMovedI *
+  autocmd! ycmcompletemecursormove
+endfunction
+
+
+function! youcompleteme#GetErrorCount()
+  return py3eval( 'ycm_state.GetErrorCount()' )
+endfunction
+
+
+function! youcompleteme#GetWarningCount()
+  return py3eval( 'ycm_state.GetWarningCount()' )
 endfunction
 
 
 function! s:SetUpPython() abort
-python << EOF
+  py3 << EOF
+import os.path as p
 import sys
+import traceback
 import vim
-import os
-import subprocess
 
-script_folder = vim.eval( 's:script_folder_path' )
-sys.path.insert( 0, os.path.join( script_folder, '../python' ) )
-sys.path.insert( 0, os.path.join( script_folder, '../third_party/ycmd' ) )
-from ycmd import utils
-utils.AddNearestThirdPartyFoldersToSysPath( script_folder )
+root_folder = p.normpath( p.join( vim.eval( 's:script_folder_path' ), '..' ) )
+third_party_folder = p.join( root_folder, 'third_party' )
 
-# We need to import ycmd's third_party folders as well since we import and
-# use ycmd code in the client.
-utils.AddNearestThirdPartyFoldersToSysPath( utils.__file__ )
-from ycm import base
-base.LoadJsonDefaultsIntoVim()
-from ycmd import user_options_store
-user_options_store.SetAll( base.BuildServerConf() )
-from ycm import vimsupport
+# Add dependencies to Python path.
+sys.path[ 0:0 ] = [ p.join( root_folder, 'python' ),
+                    p.join( third_party_folder, 'ycmd' ) ]
 
-popen_args = [ utils.PathToPythonInterpreter(),
-               os.path.join( script_folder,
-                             '../third_party/ycmd/check_core_version.py') ]
+# We enclose this code in a try/except block to avoid backtraces in Vim.
+try:
+  # Import the modules used in this file.
+  from ycm import base, vimsupport, youcompleteme
+  from ycm import semantic_highlighting as ycm_semantic_highlighting
+  from ycm import inlay_hints as ycm_inlay_hints
 
-if utils.SafePopen( popen_args ).wait() == 2:
-  vimsupport.PostVimMessage(
-    'YouCompleteMe unavailable: YCM support libs too old, PLEASE RECOMPILE' )
-  vim.command( 'return 0')
+  if 'ycm_state' in globals():
+    # If re-initializing, pretend that we shut down
+    ycm_state.OnVimLeave()
+    del ycm_state
 
-from ycm.youcompleteme import YouCompleteMe
-ycm_state = YouCompleteMe( user_options_store.GetAll() )
-vim.command( 'return 1')
+  # If we're able to resolve completion details asynchronously, set the option
+  # which enables this in the server.
+  if int( vim.eval( 's:resolve_completions == s:RESOLVE_ON_DEMAND' ) ):
+    # resolve a small number upfront, the rest on demand
+    default_options = {
+      'max_num_candidates_to_detail': 10
+    }
+  elif int( vim.eval( 's:resolve_completions == s:RESOLVE_NONE' ) ):
+    # don't resolve any
+    default_options = {
+      'max_num_candidates_to_detail': 0
+    }
+  else:
+    # i.e. s:resolve_completions == s:RESOLVE_UP_FRONT
+    # The server will decide - i.e. resolve everything upfront
+    default_options = {}
+
+  ycm_state = youcompleteme.YouCompleteMe( default_options )
+except Exception as error:
+  # We don't use PostVimMessage or EchoText from the vimsupport module because
+  # importing this module may fail.
+  vim.command( 'redraw | echohl WarningMsg' )
+  for line in traceback.format_exc().splitlines():
+    vim.command( "echom '{0}'".format( line.replace( "'", "''" ) ) )
+
+  vim.command( "echo 'YouCompleteMe unavailable: {0}'"
+               .format( str( error ).replace( "'", "''" ) ) )
+  vim.command( 'echohl None' )
+  vim.command( 'return 0' )
+else:
+  vim.command( 'return 1' )
 EOF
 endfunction
 
@@ -169,15 +346,19 @@ function! s:SetUpKeyMappings()
     " With this command, when the completion window is visible, the tab key
     " (default) will select the next candidate in the window. In vim, this also
     " changes the typed-in text to that of the candidate completion.
-    exe 'inoremap <expr>' . key .
-          \ ' pumvisible() ? "\<C-n>" : "\' . key .'"'
+    exe 'inoremap <expr>' . key .  ' pumvisible() ? "\<C-n>" : "\' . key .'"'
   endfor
-
 
   for key in g:ycm_key_list_previous_completion
     " This selects the previous candidate for shift-tab (default)
-    exe 'inoremap <expr>' . key .
-          \ ' pumvisible() ? "\<C-p>" : "\' . key .'"'
+    exe 'inoremap <expr>' . key . ' pumvisible() ? "\<C-p>" : "\' . key .'"'
+  endfor
+
+  for key in g:ycm_key_list_stop_completion
+    " When selecting a candidate and closing the completion menu with the <C-y>
+    " key, the menu will automatically be reopened because of the TextChangedI
+    " event. We define a command to prevent that.
+    exe 'inoremap <expr>' . key . ' <SID>StopCompletion( "\' . key . '" )'
   endfor
 
   if !empty( g:ycm_key_invoke_completion )
@@ -188,14 +369,13 @@ function! s:SetUpKeyMappings()
       imap <Nul> <C-Space>
     endif
 
-    " <c-x><c-o> trigger omni completion, <c-p> deselects the first completion
-    " candidate that vim selects by default
-    silent! exe 'inoremap <unique> ' . invoke_key .  ' <C-X><C-O><C-P>'
+    silent! exe 'inoremap <unique> <silent> ' . invoke_key .
+          \ ' <C-R>=<SID>RequestSemanticCompletion()<CR>'
   endif
 
   if !empty( g:ycm_key_detailed_diagnostics )
     silent! exe 'nnoremap <unique> ' . g:ycm_key_detailed_diagnostics .
-          \ ' :YcmShowDetailedDiagnostic<cr>'
+          \ ' :YcmShowDetailedDiagnostic<CR>'
   endif
 endfunction
 
@@ -206,32 +386,41 @@ function! s:SetUpSigns()
 
   if !hlexists( 'YcmErrorSign' )
     if hlexists( 'SyntasticErrorSign')
-      highlight link YcmErrorSign SyntasticErrorSign
+      highlight default link YcmErrorSign SyntasticErrorSign
     else
-      highlight link YcmErrorSign error
+      highlight default link YcmErrorSign error
     endif
   endif
 
   if !hlexists( 'YcmWarningSign' )
     if hlexists( 'SyntasticWarningSign')
-      highlight link YcmWarningSign SyntasticWarningSign
+      highlight default link YcmWarningSign SyntasticWarningSign
     else
-      highlight link YcmWarningSign todo
+      highlight default link YcmWarningSign todo
     endif
   endif
 
   if !hlexists( 'YcmErrorLine' )
-    highlight link YcmErrorLine SyntasticErrorLine
+    highlight default link YcmErrorLine SyntasticErrorLine
   endif
 
   if !hlexists( 'YcmWarningLine' )
-    highlight link YcmWarningLine SyntasticWarningLine
+    highlight default link YcmWarningLine SyntasticWarningLine
   endif
 
-  exe 'sign define YcmError text=' . g:ycm_error_symbol .
-        \ ' texthl=YcmErrorSign linehl=YcmErrorLine'
-  exe 'sign define YcmWarning text=' . g:ycm_warning_symbol .
-        \ ' texthl=YcmWarningSign linehl=YcmWarningLine'
+  call sign_define( [
+    \ { 'name': 'YcmError',
+    \   'text': g:ycm_error_symbol,
+    \   'texthl': 'YcmErrorSign',
+    \   'linehl': 'YcmErrorLine',
+    \   'group':  'ycm_signs' },
+    \ { 'name': 'YcmWarning',
+    \   'text': g:ycm_warning_symbol,
+    \   'texthl': 'YcmWarningSign',
+    \   'linehl': 'YcmWarningLine',
+    \   'group':  'ycm_signs' }
+    \ ] )
+
 endfunction
 
 
@@ -241,18 +430,91 @@ function! s:SetUpSyntaxHighlighting()
 
   if !hlexists( 'YcmErrorSection' )
     if hlexists( 'SyntasticError' )
-      highlight link YcmErrorSection SyntasticError
+      highlight default link YcmErrorSection SyntasticError
     else
-      highlight link YcmErrorSection SpellBad
+      highlight default link YcmErrorSection SpellBad
     endif
+  endif
+  if s:PropertyTypeNotDefined( 'YcmErrorProperty' )
+    call prop_type_add( 'YcmErrorProperty', {
+          \ 'highlight': 'YcmErrorSection',
+          \ 'priority': 30,
+          \ 'combine': 0,
+          \ 'override': 1 } )
+  endif
+
+  " Used for virtual text
+  if !hlexists( 'YcmInvisible' )
+    highlight default link YcmInvisible Normal
+  endif
+  if !hlexists( 'YcmInlayHint' )
+    highlight default link YcmInlayHint NonText
+  endif
+  if !hlexists( 'YcmErrorText' )
+    if exists( '*hlget' )
+      let YcmErrorText = hlget( 'SpellBad', v:true )[ 0 ]
+      let YcmErrorText.name = 'YcmErrorText'
+      let YcmErrorText.cterm = {}
+      let YcmErrorText.gui = {}
+      let YcmErrorText.term = {}
+      call hlset( [ YcmErrorText ] )
+    else
+      " approximation
+      hi default link YcmErrorText WarningMsg
+    endif
+  endif
+  if !hlexists( 'YcmWarningText' )
+    if exists( '*hlget' )
+      let YcmWarningText = hlget( 'SpellCap', v:true )[ 0 ]
+      let YcmWarningText.name = 'YcmWarningText'
+      let YcmWarningText.cterm = {}
+      let YcmWarningText.gui = {}
+      let YcmWarningText.term = {}
+      call hlset( [ YcmWarningText] )
+    else
+      " Lame approximation
+      hi default link YcmWarningText Conceal
+    endif
+  endif
+
+  if s:PropertyTypeNotDefined( 'YcmVirtDiagError' )
+    call prop_type_add( 'YcmVirtDiagError', {
+          \ 'highlight': 'YcmErrorText',
+          \ 'priority': 20,
+          \ 'combine': 0 } )
+  endif
+  if s:PropertyTypeNotDefined( 'YcmVirtDiagWarning' )
+    call prop_type_add( 'YcmVirtDiagWarning', {
+          \ 'highlight': 'YcmWarningText',
+          \ 'priority': 19,
+          \ 'combine': 0 } )
+  endif
+
+
+  if s:PropertyTypeNotDefined( 'YcmVirtDiagPadding' )
+    call prop_type_add( 'YcmVirtDiagPadding', {
+          \ 'highlight': 'YcmInvisible',
+          \ 'priority': 100,
+          \ 'combine': 1 } )
   endif
 
   if !hlexists( 'YcmWarningSection' )
     if hlexists( 'SyntasticWarning' )
-      highlight link YcmWarningSection SyntasticWarning
+      highlight default link YcmWarningSection SyntasticWarning
     else
-      highlight link YcmWarningSection SpellCap
+      highlight default link YcmWarningSection SpellCap
     endif
+  endif
+  if s:PropertyTypeNotDefined( 'YcmWarningProperty' )
+    call prop_type_add( 'YcmWarningProperty', {
+          \ 'highlight': 'YcmWarningSection',
+          \ 'priority': 29,
+          \ 'combine': 0,
+          \ 'override': 1 } )
+  endif
+
+  if !hlexists( 'YcmErrorPopup' )
+    highlight default link YcmErrorPopup ErrorMsg
   endif
 endfunction
 
@@ -279,30 +541,64 @@ function! s:TurnOffSyntasticForCFamily()
   let g:syntastic_c_checkers = []
   let g:syntastic_objc_checkers = []
   let g:syntastic_objcpp_checkers = []
+  let g:syntastic_cuda_checkers = []
 endfunction
 
 
-function! s:DiagnosticUiSupportedForCurrentFiletype()
-  return get( s:diagnostic_ui_filetypes, &filetype, 0 )
-endfunction
-
-
-function! s:AllowedToCompleteInCurrentFile()
-  if empty( &filetype ) ||
-        \ getbufvar( winbufnr( winnr() ), "&buftype" ) ==# 'nofile' ||
-        \ &filetype ==# 'qf'
-    return 0
-  endif
-
+function! s:DisableOnLargeFile( buffer )
   if exists( 'b:ycm_largefile' )
+    return b:ycm_largefile
+  endif
+
+  let threshold = g:ycm_disable_for_files_larger_than_kb * 1024
+  let b:ycm_largefile =
+        \ threshold > 0 && getfsize( expand( a:buffer ) ) > threshold
+  if b:ycm_largefile
+    py3 vimsupport.PostVimMessage( 'YouCompleteMe is disabled in this buffer;' +
+          \ ' the file exceeded the max size (see YCM options).' )
+  endif
+  return b:ycm_largefile
+endfunction
+
+function! s:PropertyTypeNotDefined( type )
+  return exists( '*prop_type_add' ) &&
+    \ index( prop_type_list(), a:type ) == -1
+endfunction
+
+function! s:AllowedToCompleteInBuffer( buffer )
+  let buftype = getbufvar( a:buffer, '&buftype' )
+
+  if has_key( s:buftype_blacklist, buftype )
     return 0
   endif
 
-  let whitelist_allows = has_key( g:ycm_filetype_whitelist, '*' ) ||
-        \ has_key( g:ycm_filetype_whitelist, &filetype )
-  let blacklist_allows = !has_key( g:ycm_filetype_blacklist, &filetype )
+  let filetype = getbufvar( a:buffer, '&filetype' )
+  if empty( filetype )
+    let filetype = 'ycm_nofiletype'
+  endif
 
-  return whitelist_allows && blacklist_allows
+  let allowed = youcompleteme#filetypes#AllowedForFiletype( filetype )
+
+  if !allowed || s:DisableOnLargeFile( a:buffer )
+    return 0
+  endif
+
+  let s:previous_allowed_buffer_number = bufnr( a:buffer )
+  return allowed
+endfunction
+
+
+function! s:AllowedToCompleteInCurrentBuffer()
+  return s:AllowedToCompleteInBuffer( '%' )
+endfunction
+
+
+function! s:VisitedBufferRequiresReparse()
+  if bufnr( '%' ) ==# s:previous_allowed_buffer_number
+    return 0
+  endif
+
+  return s:AllowedToCompleteInCurrentBuffer()
 endfunction
 
 
@@ -312,10 +608,8 @@ function! s:SetUpCpoptions()
   set cpoptions+=B
 
   " This prevents the display of "Pattern not found" & similar messages during
-  " completion. This is only available since Vim 7.4.314
-  if pyeval( 'vimsupport.VimVersionAtLeast("7.4.314")' )
-    set shortmess+=c
-  endif
+  " completion.
+  set shortmess+=c
 endfunction
 
 
@@ -337,223 +631,468 @@ function! s:SetUpCompleteopt()
   " Also, having this option set breaks the plugin.
   set completeopt-=longest
 
-  if g:ycm_add_preview_to_completeopt
+  if s:resolve_completions == s:RESOLVE_ON_DEMAND
+    set completeopt+=popuphidden
+  endif
+
+  if s:force_preview_popup
+    set completeopt+=popup
+  elseif g:ycm_add_preview_to_completeopt
     set completeopt+=preview
   endif
 endfunction
 
 
-" For various functions/use-cases, we want to keep track of whether the buffer
-" has changed since the last time they were invoked. We keep the state of
-" b:changedtick of the last time the specific function was called in
-" b:ycm_changedtick.
-function! s:SetUpYcmChangedTick()
-  let b:ycm_changedtick  =
-        \ get( b:, 'ycm_changedtick', {
-        \   'file_ready_to_parse' : -1,
-        \ } )
+function! s:EnableCompletingInCurrentBuffer()
+  if !g:ycm_auto_trigger
+    call s:SetCompleteFunc()
+  endif
+  let b:ycm_completing = 1
+endfunction
+
+
+function s:StopPoller( poller ) abort
+  call timer_stop( a:poller.id )
+  let a:poller.id = -1
 endfunction
 
 
 function! s:OnVimLeave()
-  py ycm_state.OnVimLeave()
+  " Workaround a NeoVim issue - not shutting down timers correctly
+  " https://github.com/neovim/neovim/issues/6840
+  for poller in values( s:pollers )
+    call s:StopPoller( poller )
+  endfor
+  py3 ycm_state.OnVimLeave()
 endfunction
 
 
 function! s:OnCompleteDone()
-  py ycm_state.OnCompleteDone()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
+
+  let s:last_char_inserted_by_user = v:false
+
+  py3 ycm_state.OnCompleteDone()
+  call s:UpdateSignatureHelp()
 endfunction
 
 
-function! s:OnBufferReadPre(filename)
-  let threshold = g:ycm_disable_for_files_larger_than_kb * 1024
+function! s:OnCompleteChanged()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
 
-  if threshold > 0 && getfsize( a:filename ) > threshold
-    echohl WarningMsg |
-          \ echomsg "YouCompleteMe is disabled in this buffer; " .
-          \ "the file exceeded the max size (see YCM options)." |
-          \ echohl None
-    let b:ycm_largefile = 1
+  if ! empty( v:event.completed_item )
+    let s:last_char_inserted_by_user = v:false
+    call s:ResolveCompletionItem( v:event.completed_item )
+  endif
+
+  call s:UpdateSignatureHelp()
+endfunction
+
+
+function! s:ResolveCompletionItem( item )
+  if s:resolve_completions != s:RESOLVE_ON_DEMAND
+    return
+  endif
+
+  let complete_mode = complete_info( [ 'mode' ] ).mode
+  if complete_mode !=# 'eval' && complete_mode !=# 'function'
+    return
+  endif
+
+  if py3eval( 'ycm_state.ResolveCompletionItem( vim.eval( "a:item" ) )' )
+    call s:StopPoller( s:pollers.completion )
+    call timer_start( 0, function( 's:PollResolve', [ a:item ] ) )
+  else
+    call s:ShowInfoPopup( a:item )
   endif
 endfunction
 
-function! s:OnBufferVisit()
-  " We need to do this even when we are not allowed to complete in the current
-  " file because we might be allowed to complete in the future! The canonical
-  " example is creating a new buffer with :enew and then setting a filetype.
-  call s:SetUpYcmChangedTick()
 
-  if !s:AllowedToCompleteInCurrentFile()
+function! s:EnableAutoHover()
+  if g:ycm_auto_hover ==# 'CursorHold' && s:enable_hover
+    augroup YcmBufHover
+      autocmd! * <buffer>
+      autocmd CursorHold <buffer> call s:Hover()
+      if exists( '##WinResized' )
+        autocmd WinResized <buffer> call popup_close( s:cursorhold_popup )
+      endif
+      if exists( '##WinScrolled' )
+        autocmd WinScrolled <buffer> call popup_close( s:cursorhold_popup )
+      endif
+    augroup END
+  endif
+endfunction
+
+
+function! s:DisableAutoHover()
+  augroup YcmBufHover
+    autocmd! * <buffer>
+  augroup END
+endfunction
+
+
+function! s:OnFileTypeSet()
+  " The contents of the command-line window are empty when the filetype is set
+  " for the first time. Users should never change its filetype so we only rely
+  " on the CmdwinEnter event for that window.
+  if !empty( getcmdwintype() )
+    return
+  endif
+
+  if !s:AllowedToCompleteInCurrentBuffer()
     return
   endif
 
   call s:SetUpCompleteopt()
-  call s:SetCompleteFunc()
-  py ycm_state.OnBufferVisit()
-  call s:OnFileReadyToParse()
+  call s:EnableCompletingInCurrentBuffer()
+  call s:StartMessagePoll()
+  call s:EnableAutoHover()
+
+  py3 ycm_state.OnFileTypeSet()
+  call s:OnFileReadyToParse( 1 )
 endfunction
 
 
-function! s:OnBufferUnload( deleted_buffer_file )
-  if !s:AllowedToCompleteInCurrentFile() || empty( a:deleted_buffer_file )
+function! s:OnFileSave()
+  let buffer_number = str2nr( expand( '<abuf>' ) )
+  if !s:AllowedToCompleteInBuffer( buffer_number )
     return
   endif
-
-  py ycm_state.OnBufferUnload( vim.eval( 'a:deleted_buffer_file' ) )
+  py3 ycm_state.OnFileSave( vimsupport.GetIntValue( 'buffer_number' ) )
 endfunction
 
 
-function! s:OnCursorHold()
-  if !s:AllowedToCompleteInCurrentFile()
+function! s:AbortAutohoverRequest() abort
+  if g:ycm_auto_hover ==# 'CursorHold' && s:enable_hover
+    let requests = copy( s:pollers.command.requests )
+    for request_id in keys( requests )
+      let request = requests[ request_id ]
+      if request.origin == 'autohover'
+        call remove( s:pollers.command.requests, request_id )
+        call request.callback( '' )
+      endif
+    endfor
+  endif
+endfunction
+
+
+function! s:OnBufferEnter()
+  call s:StartMessagePoll()
+  if !s:VisitedBufferRequiresReparse()
     return
   endif
+
+  call s:AbortAutohoverRequest()
 
   call s:SetUpCompleteopt()
-  call s:OnFileReadyToParse()
+  call s:EnableCompletingInCurrentBuffer()
+
+  py3 ycm_state.UpdateMatches()
+  py3 ycm_state.OnBufferVisit()
+  " Last parse may be outdated because of changes from other buffers. Force a
+  " new parse.
+  call s:OnFileReadyToParse( 1 )
 endfunction
 
 
-function! s:OnFileReadyToParse()
-  " We need to call this just in case there is no b:ycm_changetick; this can
-  " happen for special buffers.
-  call s:SetUpYcmChangedTick()
-
-  " Order is important here; we need to extract any done diagnostics before
-  " reparsing the file again. If we sent the new parse request first, then
-  " the response would always be pending when we called
-  " UpdateDiagnosticNotifications.
-  call s:UpdateDiagnosticNotifications()
-
-  let buffer_changed = b:changedtick != b:ycm_changedtick.file_ready_to_parse
-  if buffer_changed
-    py ycm_state.OnFileReadyToParse()
-  endif
-  let b:ycm_changedtick.file_ready_to_parse = b:changedtick
-endfunction
-
-
-function! s:SetCompleteFunc()
-  let &completefunc = 'youcompleteme#Complete'
-  let &l:completefunc = 'youcompleteme#Complete'
-endfunction
-
-
-function! s:SetOmnicompleteFunc()
-  if pyeval( 'ycm_state.NativeFiletypeCompletionUsable()' )
-    let &omnifunc = 'youcompleteme#OmniComplete'
-    let &l:omnifunc = 'youcompleteme#OmniComplete'
-
-  " If we don't have native filetype support but the omnifunc is set to YCM's
-  " omnifunc because the previous file the user was editing DID have native
-  " support, we remove our omnifunc.
-  elseif &omnifunc == 'youcompleteme#OmniComplete'
-    let &omnifunc = ''
-    let &l:omnifunc = ''
-  endif
-endfunction
-
-function! s:OnCursorMovedInsertMode()
-  if !s:AllowedToCompleteInCurrentFile()
+function! s:OnBufferUnload()
+  " Expanding <abuf> returns the unloaded buffer number as a string but we want
+  " it as a true number for the getbufvar function.
+  let buffer_number = str2nr( expand( '<abuf>' ) )
+  if !s:AllowedToCompleteInBuffer( buffer_number )
     return
   endif
 
-  py ycm_state.OnCursorMoved()
-  call s:UpdateCursorMoved()
+  py3 ycm_state.OnBufferUnload( vimsupport.GetIntValue( 'buffer_number' ) )
+endfunction
 
-  " Basically, we need to only trigger the completion menu when the user has
-  " inserted or deleted a character, NOT just when the user moves in insert mode
-  " (with, say, the arrow keys). If we trigger the menu even on pure moves, then
-  " it's impossible to move in insert mode since the up/down arrows start moving
-  " the selected completion in the completion menu. Yeah, people shouldn't be
-  " moving in insert mode at all (that's what normal mode is for) but explain
-  " that to the users who complain...
-  if !s:BufferTextChangedSinceLastMoveInInsertMode()
+
+function! s:PollServerReady( timer_id )
+  if !py3eval( 'ycm_state.IsServerAlive()' )
+    py3 ycm_state.NotifyUserIfServerCrashed()
+    " Server crashed. Don't poll it again.
     return
   endif
 
-  call s:IdentifierFinishedOperations()
-  if g:ycm_autoclose_preview_window_after_completion
-    call s:ClosePreviewWindowIfNeeded()
+  if !py3eval( 'ycm_state.CheckIfServerIsReady()' )
+    let s:pollers.server_ready.id = timer_start(
+          \ s:pollers.server_ready.wait_milliseconds,
+          \ function( 's:PollServerReady' ) )
+    return
   endif
 
-  if g:ycm_auto_trigger || s:omnifunc_mode
-    call s:InvokeCompletion()
+  call s:OnFileTypeSet()
+endfunction
+
+
+function! s:OnFileReadyToParse( ... )
+  " Accepts an optional parameter that is either 0 or 1. If 1, send a
+  " FileReadyToParse event notification, whether the buffer has changed or not;
+  " effectively forcing a parse of the buffer. Default is 0.
+  let force_parsing = a:0 > 0 && a:1
+
+  " We only want to send a new FileReadyToParse event notification if the buffer
+  " has changed since the last time we sent one, or if forced.
+  if force_parsing || py3eval( "ycm_state.NeedsReparse()" )
+    " We switched buffers or something, so clear.
+    " FIXME: sig help should be buffer local?
+    call s:ClearSignatureHelp()
+    py3 ycm_state.OnFileReadyToParse()
+
+    call s:StopPoller( s:pollers.file_parse_response )
+    let s:pollers.file_parse_response.id = timer_start(
+          \ s:pollers.file_parse_response.wait_milliseconds,
+          \ function( 's:PollFileParseResponse' ) )
+
+    call s:UpdateSemanticHighlighting( bufnr(), 1, 0 )
+    call s:UpdateInlayHints( bufnr(), 1, 0 )
+
+  endif
+endfunction
+
+function! s:UpdateSemanticHighlighting( bufnr, force, redraw_anyway ) abort
+  call s:StopPoller( s:pollers.semantic_highlighting )
+  if !s:is_neovim &&
+        \ get( b:, 'ycm_enable_semantic_highlighting',
+        \   get( g:, 'ycm_enable_semantic_highlighting', 0 ) )
+
+    if py3eval(
+        \ 'ycm_state.Buffer( int( vim.eval( "a:bufnr" ) ) ).'
+        \ . 'semantic_highlighting.Request( '
+        \ . '  force=int( vim.eval( "a:force" ) ) )' )
+      let s:pollers.semantic_highlighting.id = timer_start(
+            \ s:pollers.semantic_highlighting.wait_milliseconds,
+            \ function( 's:PollSemanticHighlighting', [ a:bufnr ] ) )
+    elseif a:redraw_anyway
+      py3 ycm_state.Buffer(
+            \ int( vim.eval( "a:bufnr" ) ) ).semantic_highlighting.Refresh()
+    endif
+  endif
+endfunction
+
+
+function s:ShouldUseInlayHintsNow( bufnr )
+  return s:enable_inlay_hints &&
+        \ getbufvar( a:bufnr, 'ycm_enable_inlay_hints',
+        \   get( g:, 'ycm_enable_inlay_hints', 0 ) )
+endfunction
+
+function! s:UpdateInlayHints( bufnr, force, redraw_anyway ) abort
+  call s:StopPoller( s:pollers.inlay_hints )
+
+  if s:ShouldUseInlayHintsNow( a:bufnr )
+    if py3eval(
+        \ 'ycm_state.Buffer( int( vim.eval( "a:bufnr" ) ) ).'
+        \ . 'inlay_hints.Request( force=int( vim.eval( "a:force" ) ) )' )
+      let s:pollers.inlay_hints.id = timer_start(
+            \ s:pollers.inlay_hints.wait_milliseconds,
+            \ function( 's:PollInlayHints', [ a:bufnr ] ) )
+    elseif a:redraw_anyway
+      py3 ycm_state.Buffer( int( vim.eval( "a:bufnr" ) ) ).inlay_hints.Refresh()
+    endif
+
+  endif
+endfunction
+
+
+function! s:PollFileParseResponse( ... )
+  if !py3eval( "ycm_state.FileParseRequestReady()" )
+    let s:pollers.file_parse_response.id = timer_start(
+          \ s:pollers.file_parse_response.wait_milliseconds,
+          \ function( 's:PollFileParseResponse' ) )
+    return
   endif
 
-  " We have to make sure we correctly leave omnifunc mode even when the user
-  " inserts something like a "operator[]" candidate string which fails
-  " CurrentIdentifierFinished check.
-  if s:omnifunc_mode && !pyeval( 'base.LastEnteredCharIsIdentifierChar()')
-    let s:omnifunc_mode = 0
+  py3 ycm_state.HandleFileParseRequest()
+  if py3eval( "ycm_state.ShouldResendFileParseRequest()" )
+    call s:OnFileReadyToParse( 1 )
   endif
+endfunction
+
+
+function! s:PollSemanticHighlighting( bufnr, ... ) abort
+  return s:PollScrollable( a:bufnr, 'semantic_highlighting' )
+endfunction
+
+
+function! s:PollInlayHints( bufnr, ... ) abort
+  return s:PollScrollable( a:bufnr, 'inlay_hints' )
+endfunction
+
+
+function! s:PollScrollable( bufnr, scrollable, ... ) abort
+  if !py3eval(
+      \ 'ycm_state.Buffer( int( vim.eval( "a:bufnr" ) ) )'
+      \ . '.' . a:scrollable . '.Ready()' )
+    let s:pollers[a:scrollable].id = timer_start(
+          \ s:pollers[a:scrollable].wait_milliseconds,
+          \ function( 's:PollScrollable', [ a:bufnr, a:scrollable ] ) )
+  elseif ! py3eval(
+      \ 'ycm_state.Buffer( int( vim.eval( "a:bufnr" ) ) )'
+      \ . '.' . a:scrollable . '.Update()' )
+    let s:pollers[ a:scrollable ].id = timer_start(
+          \ s:pollers[ a:scrollable ].wait_milliseconds,
+          \ function( 's:PollScrollable', [ a:bufnr, a:scrollable ] ) )
+  endif
+endfunction
+
+
+
+function! s:SendKeys( keys )
+  " By default keys are added to the end of the typeahead buffer. If there are
+  " already keys in the buffer, they will be processed first and may change
+  " the state that our keys combination was sent for (e.g. <C-X><C-U><C-P> in
+  " normal mode instead of insert mode or <C-e> outside of completion mode).
+  " We avoid that by inserting the keys at the start of the typeahead buffer
+  " with the 'i' option. Also, we don't want the keys to be remapped to
+  " something else so we add the 'n' option.
+  call feedkeys( a:keys, 'in' )
+endfunction
+
+
+function! s:CloseCompletionMenu()
+  if pumvisible()
+    call s:SendKeys( "\<C-e>" )
+  endif
+endfunction
+
+
+function! s:OnInsertChar()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
+
+  let s:last_char_inserted_by_user = v:true
+endfunction
+
+
+function! s:StopCompletion( key )
+  call s:StopPoller( s:pollers.completion )
+
+  call s:ClearSignatureHelp()
+
+  if pumvisible()
+    let s:completion_stopped = 1
+    return "\<C-y>"
+  endif
+  return a:key
 endfunction
 
 
 function! s:OnCursorMovedNormalMode()
-  if !s:AllowedToCompleteInCurrentFile()
+  if !s:AllowedToCompleteInCurrentBuffer()
     return
   endif
 
-  call s:OnFileReadyToParse()
-  py ycm_state.OnCursorMoved()
+  call s:AbortAutohoverRequest()
+
+  py3 ycm_state.OnCursorMoved()
 endfunction
 
 
-function! s:OnInsertLeave()
-  if !s:AllowedToCompleteInCurrentFile()
+function! s:OnWinScrolled()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
+  let bufnr = winbufnr( expand( '<afile>' ) )
+  call s:UpdateSemanticHighlighting( bufnr, 0, 0 )
+  call s:UpdateInlayHints( bufnr, 0, 0 )
+endfunction
+
+
+function! s:OnTextChangedNormalMode()
+  if !s:AllowedToCompleteInCurrentBuffer()
     return
   endif
 
-  let s:omnifunc_mode = 0
   call s:OnFileReadyToParse()
-  py ycm_state.OnInsertLeave()
-  if g:ycm_autoclose_preview_window_after_completion ||
-        \ g:ycm_autoclose_preview_window_after_insertion
+endfunction
+
+
+function! s:OnTextChangedInsertMode( popup_is_visible )
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
+
+  if a:popup_is_visible && !s:last_char_inserted_by_user
+    " If the last "input" wasn't from a user typing (i.e. didn't come from
+    " InsertCharPre, then ignore this change in the text. This prevents ctrl-n
+    " or tab from causing us to re-filter the list based on the now-selected
+    " item.
+    return
+  endif
+
+  let s:current_cursor_position = getpos( '.' )
+  if s:completion_stopped
+    let s:completion_stopped = 0
+    let s:completion = s:default_completion
+    return
+  endif
+
+  call s:IdentifierFinishedOperations()
+
+  " We have to make sure we correctly leave semantic mode even when the user
+  " inserts something like a "operator[]" candidate string which fails
+  " CurrentIdentifierFinished check.
+  if s:force_semantic && !py3eval( 'base.LastEnteredCharIsIdentifierChar()' )
+    let s:force_semantic = 0
+    let s:force_manual = 0
+  endif
+
+  if get( b:, 'ycm_completing' ) &&
+        \ ( g:ycm_auto_trigger || s:force_semantic || s:force_manual ) &&
+        \ !s:InsideCommentOrStringAndShouldStop() &&
+        \ !s:OnBlankLine()
+    call s:RequestCompletion()
+    call s:RequestSignatureHelp()
+  endif
+
+  py3 ycm_state.OnCursorMoved()
+
+  if g:ycm_autoclose_preview_window_after_completion
     call s:ClosePreviewWindowIfNeeded()
   endif
 endfunction
 
 
-function! s:OnInsertEnter()
-  let s:previous_num_chars_on_current_line = strlen( getline('.') )
+function! s:OnInsertEnter() abort
+  let s:current_cursor_position = getpos( '.' )
+  py3 ycm_state.OnInsertEnter()
+  if s:ShouldUseInlayHintsNow( bufnr() ) &&
+        \ get(g:, 'ycm_clear_inlay_hints_in_insert_mode' )
+    py3 ycm_state.CurrentBuffer().inlay_hints.Clear()
+  endif
+endfunction
 
-  if !s:AllowedToCompleteInCurrentFile()
+function! s:OnInsertLeave()
+  if !s:AllowedToCompleteInCurrentBuffer()
     return
   endif
 
-  if !get( b:, 'ycm_omnicomplete', 0 )
-    let b:ycm_omnicomplete = 1
-    call s:SetOmnicompleteFunc()
+  let s:last_char_inserted_by_user = v:false
+
+  call s:StopPoller( s:pollers.completion )
+  let s:force_semantic = 0
+  let s:force_manual = 0
+  let s:completion = s:default_completion
+
+  call s:OnFileReadyToParse()
+  py3 ycm_state.OnInsertLeave()
+  if g:ycm_autoclose_preview_window_after_completion ||
+        \ g:ycm_autoclose_preview_window_after_insertion
+    call s:ClosePreviewWindowIfNeeded()
   endif
 
-  let s:old_cursor_position = []
-endfunction
-
-
-function! s:UpdateCursorMoved()
-  let current_position = getpos('.')
-  let s:cursor_moved = current_position != s:old_cursor_position
-
-  let s:moved_vertically_in_insert_mode = s:old_cursor_position != [] &&
-        \ current_position[ 1 ] != s:old_cursor_position[ 1 ]
-
-  let s:old_cursor_position = current_position
-endfunction
-
-
-function! s:BufferTextChangedSinceLastMoveInInsertMode()
-  let num_chars_in_current_cursor_line = strlen( getline('.') )
-
-  if s:moved_vertically_in_insert_mode
-    let s:previous_num_chars_on_current_line = num_chars_in_current_cursor_line
-    return 0
+  call s:ClearSignatureHelp()
+  if s:ShouldUseInlayHintsNow( bufnr() )
+        \ && get( g:, 'ycm_clear_inlay_hints_in_insert_mode' )
+    " We cleared inlay hints on insert enter
+    py3 ycm_state.CurrentBuffer().inlay_hints.Refresh()
   endif
-
-  let changed_text_on_current_line = num_chars_in_current_cursor_line !=
-        \ s:previous_num_chars_on_current_line
-  let s:previous_num_chars_on_current_line = num_chars_in_current_cursor_line
-
-  return changed_text_on_current_line
 endfunction
 
 
@@ -573,24 +1112,14 @@ function! s:ClosePreviewWindowIfNeeded()
 endfunction
 
 
-function! s:UpdateDiagnosticNotifications()
-  let should_display_diagnostics = g:ycm_show_diagnostics_ui &&
-        \ s:DiagnosticUiSupportedForCurrentFiletype()
-
-  if !should_display_diagnostics
-    return
-  endif
-
-  py ycm_state.UpdateDiagnosticInterface()
-endfunction
-
-
 function! s:IdentifierFinishedOperations()
-  if !pyeval( 'base.CurrentIdentifierFinished()' )
+  if !py3eval( 'base.CurrentIdentifierFinished()' )
     return
   endif
-  py ycm_state.OnCurrentIdentifierFinished()
-  let s:omnifunc_mode = 0
+  py3 ycm_state.OnCurrentIdentifierFinished()
+  let s:force_semantic = 0
+  let s:force_manual = 0
+  let s:completion = s:default_completion
 endfunction
 
 
@@ -598,7 +1127,8 @@ endfunction
 function! s:InsideCommentOrString()
   " Has to be col('.') -1 because col('.') doesn't exist at this point. We are
   " in insert mode when this func is called.
-  let syntax_group = synIDattr( synIDtrans( synID( line( '.' ), col( '.' ) - 1, 1 ) ), 'name')
+  let syntax_group = synIDattr(
+        \ synIDtrans( synID( line( '.' ), col( '.' ) - 1, 1 ) ), 'name')
 
   if stridx(syntax_group, 'Comment') > -1
     return 1
@@ -627,235 +1157,611 @@ endfunction
 
 
 function! s:OnBlankLine()
-  return pyeval( 'not vim.current.line or vim.current.line.isspace()' )
+  return py3eval( 'not vim.current.line or vim.current.line.isspace()' )
 endfunction
 
 
-function! s:InvokeCompletion()
-  if &completefunc != "youcompleteme#Complete"
-    return
-  endif
+function! s:RequestCompletion()
+  call s:StopPoller( s:pollers.completion )
 
-  if s:InsideCommentOrStringAndShouldStop() || s:OnBlankLine()
-    return
-  endif
+  py3 ycm_state.SendCompletionRequest(
+        \ vimsupport.GetBoolValue( 's:force_semantic' ) )
 
-  " This is tricky. First, having 'refresh' set to 'always' in the dictionary
-  " that our completion function returns makes sure that our completion function
-  " is called on every keystroke. Second, when the sequence of characters the
-  " user typed produces no results in our search an infinite loop can occur. The
-  " problem is that our feedkeys call triggers the OnCursorMovedI event which we
-  " are tied to. We prevent this infinite loop from starting by making sure that
-  " the user has moved the cursor since the last time we provided completion
-  " results.
-  if !s:cursor_moved
-    return
-  endif
-
-  " <c-x><c-u> invokes the user's completion function (which we have set to
-  " youcompleteme#Complete), and <c-p> tells Vim to select the previous
-  " completion candidate. This is necessary because by default, Vim selects the
-  " first candidate when completion is invoked, and selecting a candidate
-  " automatically replaces the current text with it. Calling <c-p> forces Vim to
-  " deselect the first candidate and in turn preserve the user's current text
-  " until he explicitly chooses to replace it with a completion.
-  call feedkeys( "\<C-X>\<C-U>\<C-P>", 'n' )
-endfunction
-
-
-python << EOF
-def GetCompletionsInner():
-  request = ycm_state.GetCurrentCompletionRequest()
-  request.Start()
-  while not request.Done():
-    if bool( int( vim.eval( 'complete_check()' ) ) ):
-      return { 'words' : [], 'refresh' : 'always'}
-
-  results = base.AdjustCandidateInsertionText( request.Response() )
-  return { 'words' : results, 'refresh' : 'always' }
-EOF
-
-
-function! s:GetCompletions()
-  py results = GetCompletionsInner()
-  let results = pyeval( 'results' )
-  return results
-endfunction
-
-
-" This is our main entry point. This is what vim calls to get completions.
-function! youcompleteme#Complete( findstart, base )
-  " After the user types one character after the call to the omnifunc, the
-  " completefunc will be called because of our mapping that calls the
-  " completefunc on every keystroke. Therefore we need to delegate the call we
-  " 'stole' back to the omnifunc
-  if s:omnifunc_mode
-    return youcompleteme#OmniComplete( a:findstart, a:base )
-  endif
-
-  if a:findstart
-    " InvokeCompletion has this check but we also need it here because of random
-    " Vim bugs and unfortunate interactions with the autocommands of other
-    " plugins
-    if !s:cursor_moved
-      " for vim, -2 means not found but don't trigger an error message
-      " see :h complete-functions
-      return -2
-    endif
-
-    if !pyeval( 'ycm_state.IsServerAlive()' )
-      return -2
-    endif
-    py ycm_state.CreateCompletionRequest()
-    return pyeval( 'base.CompletionStartColumn()' )
+  if py3eval( 'ycm_state.CompletionRequestReady()' )
+    " We can't call complete() synchronously in the TextChangedI/TextChangedP
+    " autocommands (it's designed to be used async only completion). The result
+    " (somewhat oddly) is that the completion menu is shown, but ctrl-n doesn't
+    " actually select anything.
+    " When the request is satisfied synchronously (e.g. the omnicompleter), we
+    " must return to the main loop before triggering completion, so we use a 0ms
+    " timer for that.
+    let s:pollers.completion.id = timer_start( 0,
+                                             \ function( 's:PollCompletion' ) )
   else
-    return s:GetCompletions()
+    " Otherwise, use our usual poll timeout
+    call s:PollCompletion()
+  endif
+endfunction
+
+function! s:ManuallyRequestCompletion() abort
+  " Since this function is called in a mapping through the expression register
+  " <C-R>=, its return value is inserted (see :h c_CTRL-R_=). We don't want to
+  " insert anything so we return an empty string.
+
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return ''
+  endif
+
+  if get( b:, 'ycm_completing' )
+    let s:force_manual = 0
+    call s:RequestCompletion()
+    call s:RequestSignatureHelp()
+  endif
+
+  return ''
+endfunction
+
+function! s:SetCompleteFunc()
+   let &completefunc = 'youcompleteme#CompleteFunc'
+endfunction
+
+function! youcompleteme#CompleteFunc( findstart, base ) abort
+  call s:ManuallyRequestCompletion()
+  " Cancel, but silently stay in completion mode.
+  return -2
+endfunction
+
+inoremap <silent> <plug>(YCMComplete) <C-r>=<SID>ManuallyRequestCompletion()<CR>
+
+function! s:RequestSemanticCompletion() abort
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return ''
+  endif
+
+  if get( b:, 'ycm_completing' )
+    let s:force_semantic = 1
+    let s:current_cursor_position = getpos( '.' )
+    call s:StopPoller( s:pollers.completion )
+    py3 ycm_state.SendCompletionRequest( True )
+
+    if py3eval( 'ycm_state.CompletionRequestReady()' )
+      " We can't call complete() synchronously in the TextChangedI/TextChangedP
+      " autocommands (it's designed to be used async only completion). The
+      " result (somewhat oddly) is that the completion menu is shown, but ctrl-n
+      " doesn't actually select anything.  When the request is satisfied
+      " synchronously (e.g. the omnicompleter), we must return to the main loop
+      " before triggering completion, so we use a 0ms timer for that.
+      let s:pollers.completion.id = timer_start(
+            \ 0,
+            \ function( 's:PollCompletion' ) )
+    else
+      " Otherwise, use our usual poll timeout
+      call s:PollCompletion()
+    endif
+  endif
+
+  " Since this function is called in a mapping through the expression register
+  " <C-R>=, its return value is inserted (see :h c_CTRL-R_=). We don't want to
+  " insert anything so we return an empty string.
+  return ''
+endfunction
+
+
+function! s:PollCompletion( ... )
+  if !py3eval( 'ycm_state.CompletionRequestReady()' )
+    let s:pollers.completion.id = timer_start(
+          \ s:pollers.completion.wait_milliseconds,
+          \ function( 's:PollCompletion' ) )
+    return
+  endif
+
+  let s:completion = py3eval( 'ycm_state.GetCompletionResponse()' )
+  if s:current_cursor_position == getpos( '.' )
+    call s:Complete()
   endif
 endfunction
 
 
-function! youcompleteme#OmniComplete( findstart, base )
-  if a:findstart
-    if !pyeval( 'ycm_state.IsServerAlive()' )
-      return -2
-    endif
-    let s:omnifunc_mode = 1
-    py ycm_state.CreateCompletionRequest( force_semantic = True )
-    return pyeval( 'base.CompletionStartColumn()' )
-  else
-    return s:GetCompletions()
+function! s:PollResolve( item, ... )
+  if !py3eval( 'ycm_state.CompletionRequestReady()' )
+    let s:pollers.completion.id = timer_start(
+          \ s:pollers.completion.wait_milliseconds,
+          \ function( 's:PollResolve', [ a:item ] ) )
+    return
   endif
+
+  " Note we re-use the 'completion' request for resolves. This prevents us
+  " sending a completion request and a resolve request at the same time, as
+  " resolve requests re-use the request data from the last completion request
+  " and it must not change.
+  " We also re-use the poller, so that any new completion request effectively
+  " cancels this poller.
+  let completion_item =
+        \ py3eval( 'ycm_state.GetCompletionResponse()[ "completion" ]' )
+  if empty( completion_item ) || empty( completion_item.info )
+    return
+  endif
+
+  call s:ShowInfoPopup( completion_item )
+endfunction
+
+function! s:ShowInfoPopup( completion_item )
+  let id = popup_findinfo()
+  if id
+    call popup_settext( id, split( a:completion_item.info, '\n' ) )
+    call popup_show( id )
+  endif
+endfunction
+
+
+function! s:ShouldUseSignatureHelp()
+  return py3eval( 'vimsupport.VimSupportsPopupWindows()' )
+endfunction
+
+
+function! s:RequestSignatureHelp()
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  call s:StopPoller( s:pollers.signature_help )
+
+  if py3eval( 'ycm_state.SendSignatureHelpRequest()' )
+    call s:PollSignatureHelp()
+  endif
+endfunction
+
+
+function! s:PollSignatureHelp( ... )
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  if a:0 == 0 && s:pollers.signature_help.id >= 0
+    " OK this is a bug. We have tried to poll for a response while the timer is
+    " already running. Just return and wait for the timer to fire.
+    return
+  endif
+
+  if !py3eval( 'ycm_state.SignatureHelpRequestReady()' )
+    let s:pollers.signature_help.id = timer_start(
+          \ s:pollers.signature_help.wait_milliseconds,
+          \ function( 's:PollSignatureHelp' ) )
+    return
+  endif
+
+  let s:signature_help = py3eval( 'ycm_state.GetSignatureHelpResponse()' )
+  call s:UpdateSignatureHelp()
+endfunction
+
+function! s:Complete()
+  " It's possible for us to be called (by our timer) when we're not _strictly_
+  " in insert mode. This can happen when mode is temporarily switched, e.g.
+  " due to Ctrl-r or Ctrl-o or a timer or something. If we're not in insert
+  " mode _now_ do nothing (FIXME: or should we queue a timer ?)
+  if count( [ 'i', 'R' ], mode() ) == 0
+    return
+  endif
+
+  if s:completion.line != line( '.' )
+    " Given
+    "   scb: column where the completion starts before auto-wrapping
+    "   cb: cursor column before auto-wrapping
+    "   sca: column where the completion starts after auto-wrapping
+    "   ca: cursor column after auto-wrapping
+    " we have
+    "   ca - sca = cb - scb
+    "   sca = scb + ca - cb
+    let s:completion.completion_start_column +=
+          \ col( '.' ) - s:completion.column
+  endif
+  if len( s:completion.completions )
+    let old_completeopt = &completeopt
+    set completeopt+=noselect
+    call complete( s:completion.completion_start_column,
+                 \ s:completion.completions )
+    let &completeopt = old_completeopt
+  elseif pumvisible()
+    call s:CloseCompletionMenu()
+  endif
+endfunction
+
+function! s:UpdateSignatureHelp()
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  call py3eval(
+        \ 'ycm_state.UpdateSignatureHelp( vim.eval( "s:signature_help" ) )' )
+endfunction
+
+
+function! s:ClearSignatureHelp()
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  call s:StopPoller( s:pollers.signature_help )
+  let s:signature_help = s:default_signature_help
+  call py3eval( 'ycm_state.ClearSignatureHelp()' )
 endfunction
 
 
 function! youcompleteme#ServerPid()
-  return pyeval( 'ycm_state.ServerPid()' )
+  return py3eval( 'ycm_state.ServerPid()' )
+endfunction
+
+
+function! s:SetUpCommands()
+  command! YcmRestartServer call s:RestartServer()
+  command! YcmDebugInfo call s:DebugInfo()
+  command! -nargs=* -complete=custom,youcompleteme#LogsComplete -count=0
+        \ YcmToggleLogs call s:ToggleLogs( <f-count>,
+                                         \ <f-mods>,
+                                         \ <f-args>)
+  command! -nargs=* -complete=custom,youcompleteme#SubCommandsComplete -range
+        \ YcmCompleter call s:CompleterCommand(<q-mods>,
+        \                                      <count>,
+        \                                      <line1>,
+        \                                      <line2>,
+        \                                      <f-args>)
+  command! YcmDiags call s:ShowDiagnostics()
+  command! -nargs=? YcmShowDetailedDiagnostic
+        \ call s:ShowDetailedDiagnostic( <f-args> )
+  command! YcmForceCompileAndDiagnostics call s:ForceCompileAndDiagnostics()
 endfunction
 
 
 function! s:RestartServer()
-  py ycm_state.RestartServer()
+  call s:SetUpOptions()
+
+  py3 ycm_state.RestartServer()
+
+  call s:StopPoller( s:pollers.receive_messages )
+  call s:StopPoller( s:pollers.command )
+  call s:ClearSignatureHelp()
+
+  call s:StopPoller( s:pollers.server_ready )
+  let s:pollers.server_ready.id = timer_start(
+        \ s:pollers.server_ready.wait_milliseconds,
+        \ function( 's:PollServerReady' ) )
 endfunction
-
-command! YcmRestartServer call s:RestartServer()
-
-
-function! s:ShowDetailedDiagnostic()
-  py ycm_state.ShowDetailedDiagnostic()
-endfunction
-
-command! YcmShowDetailedDiagnostic call s:ShowDetailedDiagnostic()
 
 
 function! s:DebugInfo()
   echom "Printing YouCompleteMe debug information..."
-  let debug_info = pyeval( 'ycm_state.DebugInfo()' )
+  let debug_info = py3eval( 'ycm_state.DebugInfo()' )
+  echom '-- Resolve completions:'
+        \ ( s:resolve_completions == s:RESOLVE_ON_DEMAND ? 'On demand' :
+        \      s:resolve_completions == s:RESOLVE_UP_FRONT ? 'Up front' :
+        \       'Never' )
   for line in split( debug_info, "\n" )
     echom '-- ' . line
   endfor
 endfunction
 
-command! YcmDebugInfo call s:DebugInfo()
+
+function! s:ToggleLogs( count, ... )
+  py3 ycm_state.ToggleLogs( vimsupport.GetIntValue( 'a:count' ),
+                          \ *vim.eval( 'a:000' ) )
+endfunction
 
 
-function! s:CompleterCommand(...)
-  " CompleterCommand will call the OnUserCommand function of a completer.
-  " If the first arguments is of the form "ft=..." it can be used to specify the
-  " completer to use (for example "ft=cpp").  Else the native filetype completer
-  " of the current buffer is used.  If no native filetype completer is found and
-  " no completer was specified this throws an error.  You can use
-  " "ft=ycm:ident" to select the identifier completer.
-  " The remaining arguments will be passed to the completer.
-  let arguments = copy(a:000)
-  let completer = ''
+function! youcompleteme#LogsComplete( arglead, cmdline, cursorpos )
+  return join( py3eval( 'list( ycm_state.GetLogfiles() )' ), "\n" )
+endfunction
 
-  if a:0 > 0 && strpart(a:1, 0, 3) == 'ft='
-    if a:1 == 'ft=ycm:ident'
-      let completer = 'identifier'
-    endif
-    let arguments = arguments[1:]
+
+function! youcompleteme#GetCommandResponse( ... ) abort
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return ''
   endif
 
-  py ycm_state.SendCommandRequest( vim.eval( 'l:arguments' ),
-        \                          vim.eval( 'l:completer' ) )
+  if !get( b:, 'ycm_completing' )
+    return ''
+  endif
+
+  return py3eval( 'ycm_state.GetCommandResponse( vim.eval( "a:000" ) )' )
+endfunction
+
+
+function! s:GetCommandResponseAsyncImpl( callback, origin, ... ) abort
+  let request_id = py3eval(
+        \ 'ycm_state.SendCommandRequestAsync( vim.eval( "a:000" ) )' )
+
+  let s:pollers.command.requests[ request_id ] = {
+        \ 'response_func': 'StringResponse',
+        \ 'origin': a:origin,
+        \ 'callback': a:callback
+        \ }
+  if s:pollers.command.id == -1
+    let s:pollers.command.id = timer_start( s:pollers.command.wait_milliseconds,
+                                          \ function( 's:PollCommands' ) )
+  endif
+endfunction
+
+
+function! youcompleteme#GetCommandResponseAsync( callback, ... ) abort
+  if !s:AllowedToCompleteInCurrentBuffer()
+    eval a:callback( '' )
+    return
+  endif
+
+  if !get( b:, 'ycm_completing' )
+    eval a:callback( '' )
+    return
+  endif
+
+  call s:GetCommandResponseAsyncImpl( callback, 'extern', a:000 )
+endfunction
+
+
+function! youcompleteme#GetRawCommandResponseAsync( callback, ... ) abort
+  if !s:AllowedToCompleteInCurrentBuffer()
+    eval a:callback( { 'error': 'ycm not allowed in buffer' } )
+    return
+  endif
+
+  if !get( b:, 'ycm_completing' )
+    eval a:callback( { 'error': 'ycm disabled in buffer' } )
+    return
+  endif
+
+  let request_id = py3eval(
+        \ 'ycm_state.SendCommandRequestAsync( vim.eval( "a:000" ) )' )
+
+  let s:pollers.command.requests[ request_id ] = {
+        \ 'response_func': 'Response',
+        \ 'origin': 'extern_raw',
+        \ 'callback': a:callback
+        \ }
+  if s:pollers.command.id == -1
+    let s:pollers.command.id = timer_start( s:pollers.command.wait_milliseconds,
+                                          \ function( 's:PollCommands' ) )
+  endif
+endfunction
+
+
+function! s:PollCommands( timer_id ) abort
+  " Clear the timer id before calling the callback, as the callback might fire
+  " more requests
+  call s:StopPoller( s:pollers.command )
+
+  " Must copy the requests because this loop is likely to modify it
+  let requests = copy( s:pollers.command.requests )
+  let poll_again = 0
+  for request_id in keys( requests )
+    let request = requests[ request_id ]
+    if py3eval( 'ycm_state.GetCommandRequest( int( vim.eval( "request_id" ) ) )'
+              \ . 'is None' )
+      " Possible in case of race conditions and things like RestartServer
+      " But particularly in the tests
+      let result = v:none
+    elseif !py3eval( 'ycm_state.GetCommandRequest( '
+                   \ . 'int( vim.eval( "request_id" ) ) ).Done()' )
+      " Not ready yet, poll again and skip this one for now
+      let poll_again = 1
+      continue
+    else
+      let result = py3eval( 'ycm_state.GetCommandRequest( '
+                          \ . 'int( vim.eval( "request_id" ) ) ).'
+                          \ . request.response_func
+                          \ . '()' )
+    endif
+
+    " This request is done
+    call remove( s:pollers.command.requests, request_id )
+    py3 ycm_state.FlushCommandRequest( vim.eval( "request_id" ) )
+    call request[ 'callback' ]( result )
+  endfor
+
+  if poll_again && s:pollers.command.id == -1
+    let s:pollers.command.id = timer_start( s:pollers.command.wait_milliseconds,
+                                          \ function( 's:PollCommands' ) )
+  endif
+endfunction
+
+
+function! s:CompleterCommand( mods, count, line1, line2, ... )
+  py3 ycm_state.SendCommandRequest(
+        \ vim.eval( 'a:000' ),
+        \ vim.eval( 'a:mods' ),
+        \ vimsupport.GetBoolValue( 'a:count != -1' ),
+        \ vimsupport.GetIntValue( 'a:line1' ),
+        \ vimsupport.GetIntValue( 'a:line2' ) )
+endfunction
+
+
+function! youcompleteme#SubCommandsComplete( arglead, cmdline, cursorpos )
+  return join( py3eval( 'ycm_state.GetDefinedSubcommands()' ), "\n" )
+endfunction
+
+
+function! youcompleteme#GetDefinedSubcommands()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return []
+  endif
+
+  if !exists( 'b:ycm_completing' )
+    return []
+  endif
+
+  return py3eval( 'ycm_state.GetDefinedSubcommands()' )
 endfunction
 
 
 function! youcompleteme#OpenGoToList()
-  set lazyredraw
-  cclose
-  execute 'belowright copen 3'
-  set nolazyredraw
-  au WinLeave <buffer> q  " automatically leave, if an option is chosen
-  redraw!
+  py3 vimsupport.PostVimMessage(
+        \ "'WARNING: youcompleteme#OpenGoToList function is deprecated. " .
+        \ "Do NOT use it.'" )
+  py3 vimsupport.OpenQuickFixList( True, True )
 endfunction
 
 
-command! -nargs=* -complete=custom,youcompleteme#SubCommandsComplete
-  \ YcmCompleter call s:CompleterCommand(<f-args>)
-
-function! youcompleteme#SubCommandsComplete( arglead, cmdline, cursorpos )
-  return join( pyeval( 'ycm_state.GetDefinedSubcommands()' ),
-    \ "\n")
+function! s:ShowDiagnostics()
+  py3 ycm_state.ShowDiagnostics()
 endfunction
 
 
-function! s:ForceCompile()
-  if !pyeval( 'ycm_state.NativeFiletypeCompletionUsable()' )
-    echom "Native filetype completion not supported for current file, "
-          \ . "cannot force recompilation."
-    return 0
+function! s:ShowDetailedDiagnostic( ... )
+  if ( a:0 && a:1 == 'popup' )
+        \ || get( g:, 'ycm_show_detailed_diag_in_popup', 0 )
+    py3 ycm_state.ShowDetailedDiagnostic( True )
+  else
+    py3 ycm_state.ShowDetailedDiagnostic( False )
   endif
-
-  echom "Forcing compilation, this will block Vim until done."
-  py ycm_state.OnFileReadyToParse()
-  while 1
-    let diagnostics_ready = pyeval(
-          \ 'ycm_state.DiagnosticsForCurrentFileReady()' )
-    if diagnostics_ready
-      break
-    endif
-
-    sleep 100m
-  endwhile
-  return 1
 endfunction
 
 
 function! s:ForceCompileAndDiagnostics()
-  let compilation_succeeded = s:ForceCompile()
-  if !compilation_succeeded
-    return
-  endif
-
-  call s:UpdateDiagnosticNotifications()
-  echom "Diagnostics refreshed."
+  py3 ycm_state.ForceCompileAndDiagnostics()
 endfunction
 
-command! YcmForceCompileAndDiagnostics call s:ForceCompileAndDiagnostics()
 
-
-function! s:ShowDiagnostics()
-  let compilation_succeeded = s:ForceCompile()
-  if !compilation_succeeded
-    return
-  endif
-
-  let diags = pyeval(
-        \ 'ycm_state.GetDiagnosticsFromStoredRequest( qflist_format = True )' )
-  if !empty( diags )
-    call setloclist( 0, diags )
-
-    if g:ycm_open_loclist_on_ycm_diags
-      lopen
+if exists( '*popup_atcursor' )
+  function s:Hover()
+    if !py3eval( 'ycm_state.NativeFiletypeCompletionUsable()' )
+      " Cancel the autocommand if it happens to have been set
+      call s:DisableAutoHover()
+      return
     endif
+
+    if !has_key( b:, 'ycm_hover' )
+      let cmds = youcompleteme#GetDefinedSubcommands()
+      if index( cmds, 'GetHover' ) >= 0
+        let b:ycm_hover = {
+              \ 'command': 'GetHover',
+              \ 'syntax': 'markdown',
+              \ }
+      elseif index( cmds, 'GetDoc' ) >= 0
+        let b:ycm_hover = {
+              \ 'command': 'GetDoc',
+              \ 'syntax': '',
+              \ }
+      elseif index( cmds, 'GetType' ) >= 0
+        let b:ycm_hover = {
+              \ 'command': 'GetType',
+              \ 'syntax': &syntax,
+              \ }
+      else
+        let b:ycm_hover = {}
+      endif
+    endif
+
+    if empty( b:ycm_hover )
+      return
+    endif
+
+    if empty( popup_getpos( s:cursorhold_popup ) )
+      call s:GetCommandResponseAsyncImpl(
+            \ function( 's:ShowHoverResult' ),
+            \ 'autohover',
+            \ b:ycm_hover.command )
+    endif
+  endfunction
+
+
+  function! s:ShowHoverResult( response )
+    call popup_hide( s:cursorhold_popup )
+
+    if empty( a:response )
+      return
+    endif
+
+    " Try to position the popup at the cursor, but avoid wrapping. If the
+    " longest line is > screen width (&columns), then we just have to wrap, and
+    " place the popup at the leftmost column.
+    "
+    " Find the longest line (FIXME: probably doesn't work well for multi-byte)
+    let lines = split( a:response, "\n" )
+    let len = max( map( copy( lines ), "len( v:val )" ) )
+
+    let wrap = 0
+    let col = 'cursor'
+
+    " max width is screen columns minus x padding (2)
+    if len >= (&columns - 2)
+      " There's at least one line > our max - enable word wrap and draw the
+      " popup at the leftmost column
+      let col = 1
+      let wrap = 1
+    endif
+
+    let popup_params = {
+          \ 'col': col,
+          \ 'wrap': wrap,
+          \ 'padding': [ 0, 1, 0, 1 ],
+          \ 'moved': 'word',
+          \ 'maxwidth': &columns,
+          \ 'close': 'click',
+          \ 'fixed': 0,
+          \ }
+
+    if has_key( b:ycm_hover, 'popup_params' )
+      let popup_params = extend( copy( popup_params ),
+                               \ b:ycm_hover.popup_params )
+    endif
+
+    let s:cursorhold_popup = popup_atcursor( lines, popup_params )
+    call setbufvar( winbufnr( s:cursorhold_popup ),
+                            \ '&syntax',
+                            \ b:ycm_hover.syntax )
+  endfunction
+
+
+  function! s:ToggleHover()
+    let pos = popup_getpos( s:cursorhold_popup )
+    if !empty( pos ) && pos.visible
+      call popup_hide( s:cursorhold_popup )
+      let s:cursorhold_popup = -1
+
+      " Disable the auto-trigger until the next cursor movement.
+      call s:DisableAutoHover()
+      augroup YCMHover
+        autocmd! CursorMoved <buffer>
+        autocmd CursorMoved <buffer> call s:EnableAutoHover()
+      augroup END
+    else
+      call s:Hover()
+    endif
+  endfunction
+
+  let s:enable_hover = 1
+  nnoremap <silent> <plug>(YCMHover) :<C-u>call <SID>ToggleHover()<CR>
+else
+  " Don't break people's mappings if this feature is disabled, just do nothing.
+  nnoremap <silent> <plug>(YCMHover) <Nop>
+endif
+
+function! youcompleteme#Test_GetPollers()
+  return s:pollers
+endfunction
+
+function! s:ToggleSignatureHelp()
+  call py3eval( 'ycm_state.ToggleSignatureHelp()' )
+  " Because we do this in a insert-mode mapping, we return empty string to
+  " insert/type nothing
+  return ''
+endfunction
+
+silent! inoremap <silent> <plug>(YCMToggleSignatureHelp)
+      \ <C-r>=<SID>ToggleSignatureHelp()<CR>
+
+function! s:ToggleInlayHints()
+  let b:ycm_enable_inlay_hints =
+        \ !get( b:,
+        \       'ycm_enable_inlay_hints',
+        \       get( g:, 'ycm_enable_inlay_hints' ) )
+
+  if !b:ycm_enable_inlay_hints && s:enable_inlay_hints
+    py3 ycm_state.CurrentBuffer().inlay_hints.Clear()
   else
-    echom "No warnings or errors detected"
+    call s:UpdateInlayHints( bufnr(), 0, 1 )
   endif
 endfunction
 
-command! YcmDiags call s:ShowDiagnostics()
-
+silent! nnoremap <silent> <plug>(YCMToggleInlayHints)
+      \ <cmd>call <SID>ToggleInlayHints()<CR>
 
 " This is basic vim plugin boilerplate
 let &cpo = s:save_cpo

@@ -1,6 +1,4 @@
-#!/usr/bin/env python
-#
-# Copyright (C) 2011, 2012  Google Inc.
+# Copyright (C) 2011-2018 YouCompleteMe contributors
 #
 # This file is part of YouCompleteMe.
 #
@@ -17,42 +15,44 @@
 # You should have received a copy of the GNU General Public License
 # along with YouCompleteMe.  If not, see <http://www.gnu.org/licenses/>.
 
-import os
-import vim
-import tempfile
-import json
-import re
-import signal
 import base64
+import json
+import logging
+import os
+import signal
+import vim
 from subprocess import PIPE
-from ycm import vimsupport
+from tempfile import NamedTemporaryFile
+from ycm import base, paths, signature_help, vimsupport
+from ycm.buffer import BufferDict
 from ycmd import utils
 from ycmd.request_wrap import RequestWrap
-from ycm.diagnostic_interface import DiagnosticInterface
 from ycm.omni_completer import OmniCompleter
 from ycm import syntax_parse
 from ycm.client.ycmd_keepalive import YcmdKeepalive
 from ycm.client.base_request import BaseRequest, BuildRequestData
 from ycm.client.completer_available_request import SendCompleterAvailableRequest
-from ycm.client.command_request import SendCommandRequest
-from ycm.client.completion_request import ( CompletionRequest,
-                                            ConvertCompletionDataToVimData )
+from ycm.client.command_request import ( SendCommandRequest,
+                                         SendCommandRequestAsync,
+                                         GetCommandResponse )
+from ycm.client.completion_request import CompletionRequest
+from ycm.client.resolve_completion_request import ResolveCompletionItem
+from ycm.client.signature_help_request import ( SignatureHelpRequest,
+                                                SigHelpAvailableByFileType )
+from ycm.client.debug_info_request import ( SendDebugInfoRequest,
+                                            FormatDebugInfoResponse )
 from ycm.client.omni_completion_request import OmniCompletionRequest
-from ycm.client.event_notification import ( SendEventNotificationAsync,
-                                            EventNotification )
-from ycmd.responses import ServerError
+from ycm.client.event_notification import SendEventNotificationAsync
+from ycm.client.shutdown_request import SendShutdownRequest
+from ycm.client.messages_request import MessagesPoll
 
-try:
-  from UltiSnips import UltiSnips_Manager
-  USE_ULTISNIPS_DATA = True
-except ImportError:
-  USE_ULTISNIPS_DATA = False
 
 def PatchNoProxy():
-  current_value = os.environ.get('no_proxy', '')
+  current_value = os.environ.get( 'no_proxy', '' )
   additions = '127.0.0.1,localhost'
-  os.environ['no_proxy'] = ( additions if not current_value
-                             else current_value + ',' + additions )
+  os.environ[ 'no_proxy' ] = ( additions if not current_value
+                               else current_value + ',' + additions )
+
 
 # We need this so that Requests doesn't end up using the local HTTP proxy when
 # talking to ycmd. Users should actually be setting this themselves when
@@ -69,100 +69,198 @@ PatchNoProxy()
 signal.signal( signal.SIGINT, signal.SIG_IGN )
 
 HMAC_SECRET_LENGTH = 16
-NUM_YCMD_STDERR_LINES_ON_CRASH = 30
-SERVER_CRASH_MESSAGE_STDERR_FILE_DELETED = (
-  'The ycmd server SHUT DOWN (restart with :YcmRestartServer). '
-  'Logfile was deleted; set g:ycm_server_keep_logfiles to see errors '
-  'in the future.' )
-SERVER_CRASH_MESSAGE_STDERR_FILE = (
-  'The ycmd server SHUT DOWN (restart with :YcmRestartServer). ' +
-  'Stderr (last {0} lines):\n\n'.format( NUM_YCMD_STDERR_LINES_ON_CRASH ) )
-SERVER_CRASH_MESSAGE_SAME_STDERR = (
-  'The ycmd server SHUT DOWN (restart with :YcmRestartServer). '
-  ' check console output for logs!' )
-SERVER_IDLE_SUICIDE_SECONDS = 10800  # 3 hours
+SERVER_SHUTDOWN_MESSAGE = (
+  "The ycmd server SHUT DOWN (restart with ':YcmRestartServer')." )
+EXIT_CODE_UNEXPECTED_MESSAGE = (
+  "Unexpected exit code {code}. "
+  "Type ':YcmToggleLogs {logfile}' to check the logs." )
+CORE_UNEXPECTED_MESSAGE = (
+  "Unexpected error while loading the YCM core library. "
+  "Type ':YcmToggleLogs {logfile}' to check the logs." )
+CORE_MISSING_MESSAGE = (
+  'YCM core library not detected; you need to compile YCM before using it. '
+  'Follow the instructions in the documentation.' )
+CORE_OUTDATED_MESSAGE = (
+  'YCM core library too old; PLEASE RECOMPILE by running the install.py '
+  'script. See the documentation for more details.' )
+PYTHON_TOO_OLD_MESSAGE = (
+  'Your python is too old to run YCM server. '
+  'Please see troubleshooting guide on YCM GitHub wiki.'
+)
+SERVER_IDLE_SUICIDE_SECONDS = 1800  # 30 minutes
+CLIENT_LOGFILE_FORMAT = 'ycm_'
+SERVER_LOGFILE_FORMAT = 'ycmd_{port}_{std}_'
+
+# Flag to set a file handle inheritable by child processes on Windows. See
+# https://msdn.microsoft.com/en-us/library/ms724935.aspx
+HANDLE_FLAG_INHERIT = 0x00000001
 
 
-class YouCompleteMe( object ):
-  def __init__( self, user_options ):
-    self._user_options = user_options
-    self._user_notified_about_crash = False
-    self._diag_interface = DiagnosticInterface( user_options )
-    self._omnicomp = OmniCompleter( user_options )
-    self._latest_file_parse_request = None
-    self._latest_completion_request = None
+class YouCompleteMe:
+  def __init__( self, default_options = {} ):
+    self._logger = logging.getLogger( 'ycm' )
+    self._client_logfile = None
     self._server_stdout = None
     self._server_stderr = None
     self._server_popen = None
-    self._filetypes_with_keywords_loaded = set()
+    self._default_options = default_options
     self._ycmd_keepalive = YcmdKeepalive()
-    self._SetupServer()
+    self._SetUpLogging()
+    self._SetUpServer()
     self._ycmd_keepalive.Start()
-    self._complete_done_hooks = {
-      'cs': lambda( self ): self._OnCompleteDone_Csharp()
-    }
 
-  def _SetupServer( self ):
+
+  def _SetUpServer( self ):
     self._available_completers = {}
-    server_port = utils.GetUnusedLocalhostPort()
-    # The temp options file is deleted by ycmd during startup
-    with tempfile.NamedTemporaryFile( delete = False ) as options_file:
-      hmac_secret = os.urandom( HMAC_SECRET_LENGTH )
-      options_dict = dict( self._user_options )
-      options_dict[ 'hmac_secret' ] = base64.b64encode( hmac_secret )
+    self._user_notified_about_crash = False
+    self._filetypes_with_keywords_loaded = set()
+    self._server_is_ready_with_cache = False
+    self._message_poll_requests = {}
+
+    self._latest_completion_request = None
+    self._latest_signature_help_request = None
+    self._signature_help_available_requests = SigHelpAvailableByFileType()
+    self._command_requests = {}
+    self._next_command_request_id = 0
+
+    self._signature_help_state = signature_help.SignatureHelpState()
+    self._user_options = base.GetUserOptions( self._default_options )
+    self._omnicomp = OmniCompleter( self._user_options )
+    self._buffers = BufferDict( self._user_options )
+
+    self._SetLogLevel()
+
+    hmac_secret = os.urandom( HMAC_SECRET_LENGTH )
+    options_dict = dict( self._user_options )
+    options_dict[ 'hmac_secret' ] = utils.ToUnicode(
+      base64.b64encode( hmac_secret ) )
+    options_dict[ 'server_keep_logfiles' ] = self._user_options[
+      'keep_logfiles' ]
+
+    # The temp options file is deleted by ycmd during startup.
+    with NamedTemporaryFile( delete = False, mode = 'w+' ) as options_file:
       json.dump( options_dict, options_file )
-      options_file.flush()
 
-      args = [ utils.PathToPythonInterpreter(),
-               _PathToServerScript(),
-               '--port={0}'.format( server_port ),
-               '--options_file={0}'.format( options_file.name ),
-               '--log={0}'.format( self._user_options[ 'server_log_level' ] ),
-               '--idle_suicide_seconds={0}'.format(
-                  SERVER_IDLE_SUICIDE_SECONDS )]
+    server_port = utils.GetUnusedLocalhostPort()
 
-      if not self._user_options[ 'server_use_vim_stdout' ]:
-        filename_format = os.path.join( utils.PathToTempDir(),
-                                        'server_{port}_{std}.log' )
+    BaseRequest.server_location = 'http://127.0.0.1:' + str( server_port )
+    BaseRequest.hmac_secret = hmac_secret
 
-        self._server_stdout = filename_format.format( port = server_port,
-                                                      std = 'stdout' )
-        self._server_stderr = filename_format.format( port = server_port,
-                                                      std = 'stderr' )
-        args.append('--stdout={0}'.format( self._server_stdout ))
-        args.append('--stderr={0}'.format( self._server_stderr ))
+    try:
+      python_interpreter = paths.PathToPythonInterpreter()
+    except RuntimeError as error:
+      error_message = (
+        f"Unable to start the ycmd server. { str( error ).rstrip( '.' ) }. "
+        "Correct the error then restart the server "
+        "with ':YcmRestartServer'." )
+      self._logger.exception( error_message )
+      vimsupport.PostVimMessage( error_message )
+      return
 
-        if self._user_options[ 'server_keep_logfiles' ]:
-          args.append('--keep_logfiles')
+    args = [ python_interpreter,
+             paths.PathToServerScript(),
+             f'--port={ server_port }',
+             f'--options_file={ options_file.name }',
+             f'--log={ self._user_options[ "log_level" ] }',
+             f'--idle_suicide_seconds={ SERVER_IDLE_SUICIDE_SECONDS }' ]
 
-      self._server_popen = utils.SafePopen( args, stdin_windows = PIPE,
-                                            stdout = PIPE, stderr = PIPE)
-      BaseRequest.server_location = 'http://127.0.0.1:' + str( server_port )
-      BaseRequest.hmac_secret = hmac_secret
+    self._server_stdout = utils.CreateLogfile(
+        SERVER_LOGFILE_FORMAT.format( port = server_port, std = 'stdout' ) )
+    self._server_stderr = utils.CreateLogfile(
+        SERVER_LOGFILE_FORMAT.format( port = server_port, std = 'stderr' ) )
+    args.append( f'--stdout={ self._server_stdout }' )
+    args.append( f'--stderr={ self._server_stderr }' )
 
-    self._NotifyUserIfServerCrashed()
+    if self._user_options[ 'keep_logfiles' ]:
+      args.append( '--keep_logfiles' )
+
+    self._server_popen = utils.SafePopen( args, stdin_windows = PIPE,
+                                          stdout = PIPE, stderr = PIPE )
+
+
+  def _SetUpLogging( self ):
+    def FreeFileFromOtherProcesses( file_object ):
+      if utils.OnWindows():
+        from ctypes import windll
+        import msvcrt
+
+        file_handle = msvcrt.get_osfhandle( file_object.fileno() )
+        windll.kernel32.SetHandleInformation( file_handle,
+                                              HANDLE_FLAG_INHERIT,
+                                              0 )
+
+    self._client_logfile = utils.CreateLogfile( CLIENT_LOGFILE_FORMAT )
+
+    handler = logging.FileHandler( self._client_logfile )
+
+    # On Windows and Python prior to 3.4, file handles are inherited by child
+    # processes started with at least one replaced standard stream, which is the
+    # case when we start the ycmd server (we are redirecting all standard
+    # outputs into a pipe). These files cannot be removed while the child
+    # processes are still up. This is not desirable for a logfile because we
+    # want to remove it at Vim exit without having to wait for the ycmd server
+    # to be completely shut down. We need to make the logfile handle
+    # non-inheritable. See https://www.python.org/dev/peps/pep-0446 for more
+    # details.
+    FreeFileFromOtherProcesses( handler.stream )
+
+    formatter = logging.Formatter( '%(asctime)s - %(levelname)s - %(message)s' )
+    handler.setFormatter( formatter )
+
+    self._logger.addHandler( handler )
+
+
+  def _SetLogLevel( self ):
+    log_level = self._user_options[ 'log_level' ]
+    numeric_level = getattr( logging, log_level.upper(), None )
+    if not isinstance( numeric_level, int ):
+      raise ValueError( f'Invalid log level: { log_level }' )
+    self._logger.setLevel( numeric_level )
+
 
   def IsServerAlive( self ):
-    returncode = self._server_popen.poll()
     # When the process hasn't finished yet, poll() returns None.
-    return returncode is None
+    return bool( self._server_popen ) and self._server_popen.poll() is None
 
 
-  def _NotifyUserIfServerCrashed( self ):
-    if self._user_notified_about_crash or self.IsServerAlive():
+  def CheckIfServerIsReady( self ):
+    if not self._server_is_ready_with_cache and self.IsServerAlive():
+      self._server_is_ready_with_cache = BaseRequest().GetDataFromHandler(
+          'ready', display_message = False )
+    return self._server_is_ready_with_cache
+
+
+  def IsServerReady( self ):
+    return self._server_is_ready_with_cache
+
+
+  def NotifyUserIfServerCrashed( self ):
+    if ( not self._server_popen or self._user_notified_about_crash or
+         self.IsServerAlive() ):
       return
     self._user_notified_about_crash = True
-    if self._server_stderr:
-      try:
-        with open( self._server_stderr, 'r' ) as server_stderr_file:
-          error_output = ''.join( server_stderr_file.readlines()[
-              : - NUM_YCMD_STDERR_LINES_ON_CRASH ] )
-          vimsupport.PostMultiLineNotice( SERVER_CRASH_MESSAGE_STDERR_FILE +
-                                          error_output )
-      except IOError:
-        vimsupport.PostVimMessage( SERVER_CRASH_MESSAGE_STDERR_FILE_DELETED )
+
+    return_code = self._server_popen.poll()
+    logfile = os.path.basename( self._server_stderr )
+    # See https://github.com/Valloric/ycmd#exit-codes for the list of exit
+    # codes.
+    if return_code == 3:
+      error_message = CORE_UNEXPECTED_MESSAGE.format( logfile = logfile )
+    elif return_code == 4:
+      error_message = CORE_MISSING_MESSAGE
+    elif return_code == 7:
+      error_message = CORE_OUTDATED_MESSAGE
+    elif return_code == 8:
+      # TODO: here we could retry but discard g:ycm_server_python_interpreter
+      error_message = PYTHON_TOO_OLD_MESSAGE
     else:
-        vimsupport.PostVimMessage( SERVER_CRASH_MESSAGE_SAME_STDERR )
+      error_message = EXIT_CODE_UNEXPECTED_MESSAGE.format( code = return_code,
+                                                           logfile = logfile )
+
+    if return_code != 8:
+      error_message = SERVER_SHUTDOWN_MESSAGE + ' ' + error_message
+    self._logger.error( error_message )
+    vimsupport.PostVimMessage( error_message )
 
 
   def ServerPid( self ):
@@ -171,51 +269,196 @@ class YouCompleteMe( object ):
     return self._server_popen.pid
 
 
-  def _ServerCleanup( self ):
-    if self.IsServerAlive():
-      self._server_popen.terminate()
+  def _ShutdownServer( self ):
+    SendShutdownRequest()
 
 
   def RestartServer( self ):
     vimsupport.PostVimMessage( 'Restarting ycmd server...' )
-    self._user_notified_about_crash = False
-    self._ServerCleanup()
-    self._SetupServer()
+    self._ShutdownServer()
+    self._SetUpServer()
 
 
-  def CreateCompletionRequest( self, force_semantic = False ):
+  def SendCompletionRequest( self, force_semantic = False ):
     request_data = BuildRequestData()
-    if ( not self.NativeFiletypeCompletionAvailable() and
-         self.CurrentFiletypeCompletionEnabled() ):
+    request_data[ 'force_semantic' ] = force_semantic
+
+    if not self.NativeFiletypeCompletionUsable():
       wrapped_request_data = RequestWrap( request_data )
       if self._omnicomp.ShouldUseNow( wrapped_request_data ):
         self._latest_completion_request = OmniCompletionRequest(
             self._omnicomp, wrapped_request_data )
-        return self._latest_completion_request
-
-    request_data[ 'working_dir' ] = os.getcwd()
+        self._latest_completion_request.Start()
+        return
 
     self._AddExtraConfDataIfNeeded( request_data )
-    if force_semantic:
-      request_data[ 'force_semantic' ] = True
     self._latest_completion_request = CompletionRequest( request_data )
-    return self._latest_completion_request
+    self._latest_completion_request.Start()
 
 
-  def SendCommandRequest( self, arguments, completer ):
-    if self.IsServerAlive():
-      return SendCommandRequest( arguments, completer )
+  def CompletionRequestReady( self ):
+    return bool( self._latest_completion_request and
+                 self._latest_completion_request.Done() )
+
+
+  def GetCompletionResponse( self ):
+    return self._latest_completion_request.Response()
+
+
+  def SignatureHelpAvailableRequestComplete( self, filetype, send_new=True ):
+    """Triggers or polls signature help available request. Returns whether or
+    not the request is complete. When send_new is False, won't send a new
+    request, only return the current status (This is used by the tests)"""
+    if not send_new and filetype not in self._signature_help_available_requests:
+      return False
+
+    return self._signature_help_available_requests[ filetype ].Done()
+
+
+  def SendSignatureHelpRequest( self ):
+    """Send a signature help request, if we're ready to. Return whether or not a
+    request was sent (and should be checked later)"""
+    if not self.NativeFiletypeCompletionUsable():
+      return False
+
+    for filetype in vimsupport.CurrentFiletypes():
+      if not self.SignatureHelpAvailableRequestComplete( filetype ):
+        continue
+
+      sig_help_available = self._signature_help_available_requests[
+          filetype ].Response()
+      if sig_help_available == 'NO':
+        continue
+
+      if sig_help_available == 'PENDING':
+        # Send another /signature_help_available request
+        self._signature_help_available_requests[ filetype ].Start( filetype )
+        continue
+
+      if not self._latest_completion_request:
+        return False
+
+      request_data = self._latest_completion_request.request_data.copy()
+      request_data[ 'signature_help_state' ] = (
+          self._signature_help_state.IsActive()
+      )
+
+      self._AddExtraConfDataIfNeeded( request_data )
+
+      self._latest_signature_help_request = SignatureHelpRequest( request_data )
+      self._latest_signature_help_request.Start()
+      return True
+
+    return False
+
+
+  def SignatureHelpRequestReady( self ):
+    return bool( self._latest_signature_help_request and
+                 self._latest_signature_help_request.Done() )
+
+
+  def GetSignatureHelpResponse( self ):
+    return self._latest_signature_help_request.Response()
+
+
+  def ClearSignatureHelp( self ):
+    self.UpdateSignatureHelp( {} )
+    if self._latest_signature_help_request:
+      self._latest_signature_help_request.Reset()
+
+
+  def UpdateSignatureHelp( self, signature_info ):
+    self._signature_help_state = signature_help.UpdateSignatureHelp(
+      self._signature_help_state,
+      signature_info )
+
+
+  def _GetCommandRequestArguments( self,
+                                   arguments,
+                                   has_range,
+                                   start_line,
+                                   end_line ):
+    extra_data = {
+      'options': {
+        'tab_size': vimsupport.GetIntValue( 'shiftwidth()' ),
+        'insert_spaces': vimsupport.GetBoolValue( '&expandtab' )
+      }
+    }
+
+    final_arguments = []
+    for argument in arguments:
+      if argument.startswith( 'ft=' ):
+        extra_data[ 'completer_target' ] = argument[ 3: ]
+        continue
+      elif argument.startswith( '--bufnr=' ):
+        extra_data[ 'bufnr' ] = int( argument[ len( '--bufnr=' ): ] )
+        continue
+
+      final_arguments.append( argument )
+
+    if has_range:
+      extra_data.update( vimsupport.BuildRange( start_line, end_line ) )
+    self._AddExtraConfDataIfNeeded( extra_data )
+
+    return final_arguments, extra_data
+
+
+
+  def SendCommandRequest( self,
+                          arguments,
+                          modifiers,
+                          has_range,
+                          start_line,
+                          end_line ):
+    final_arguments, extra_data = self._GetCommandRequestArguments(
+      arguments,
+      has_range,
+      start_line,
+      end_line )
+    return SendCommandRequest(
+      final_arguments,
+      modifiers,
+      self._user_options[ 'goto_buffer_command' ],
+      extra_data )
+
+
+  def GetCommandResponse( self, arguments ):
+    final_arguments, extra_data = self._GetCommandRequestArguments(
+      arguments,
+      False,
+      0,
+      0 )
+    return GetCommandResponse( final_arguments, extra_data )
+
+
+  def SendCommandRequestAsync( self, arguments ):
+    final_arguments, extra_data = self._GetCommandRequestArguments(
+      arguments,
+      False,
+      0,
+      0 )
+
+    request_id = self._next_command_request_id
+    self._next_command_request_id += 1
+    self._command_requests[ request_id ] = SendCommandRequestAsync(
+      final_arguments,
+      extra_data )
+    return request_id
+
+
+  def GetCommandRequest( self, request_id ):
+    return self._command_requests.get( request_id )
+
+
+  def FlushCommandRequest( self, request_id ):
+    self._command_requests.pop( request_id, None )
 
 
   def GetDefinedSubcommands( self ):
-    if self.IsServerAlive():
-      try:
-        return BaseRequest.PostDataToHandler( BuildRequestData(),
+    request = BaseRequest()
+    subcommands = request.PostDataToHandler( BuildRequestData(),
                                              'defined_subcommands' )
-      except ServerError:
-        return []
-    else:
-      return []
+    return subcommands if subcommands else []
 
 
   def GetCurrentCompletionRequest( self ):
@@ -232,290 +475,449 @@ class YouCompleteMe( object ):
     except KeyError:
       pass
 
-    exists_completer = ( self.IsServerAlive() and
-                         bool( SendCompleterAvailableRequest( filetype ) ) )
+    exists_completer = SendCompleterAvailableRequest( filetype )
+    if exists_completer is None:
+      return False
+
     self._available_completers[ filetype ] = exists_completer
     return exists_completer
 
 
   def NativeFiletypeCompletionAvailable( self ):
-    return any( [ self.FiletypeCompleterExistsForFiletype( x ) for x in
-                  vimsupport.CurrentFiletypes() ] )
+    return any( self.FiletypeCompleterExistsForFiletype( x ) for x in
+                vimsupport.CurrentFiletypes() )
 
 
   def NativeFiletypeCompletionUsable( self ):
-    return ( self.CurrentFiletypeCompletionEnabled() and
+    disabled_filetypes = self._user_options[
+      'filetype_specific_completion_to_disable' ]
+    return ( vimsupport.CurrentFiletypesEnabled( disabled_filetypes ) and
              self.NativeFiletypeCompletionAvailable() )
 
 
-  def OnFileReadyToParse( self ):
-    self._omnicomp.OnFileReadyToParse( None )
+  def NeedsReparse( self ):
+    return self.CurrentBuffer().NeedsReparse()
 
+
+  def UpdateWithNewDiagnosticsForFile( self, filepath, diagnostics ):
+    if not self._user_options[ 'show_diagnostics_ui' ]:
+      return
+
+    bufnr = vimsupport.GetBufferNumberForFilename( filepath )
+    if bufnr in self._buffers and vimsupport.BufferIsVisible( bufnr ):
+      # Note: We only update location lists, etc. for visible buffers, because
+      # otherwise we default to using the current location list and the results
+      # are that non-visible buffer errors clobber visible ones.
+      self._buffers[ bufnr ].UpdateWithNewDiagnostics( diagnostics, True )
+    else:
+      # The project contains errors in file "filepath", but that file is not
+      # open in any buffer. This happens for Language Server Protocol-based
+      # completers, as they return diagnostics for the entire "project"
+      # asynchronously (rather than per-file in the response to the parse
+      # request).
+      #
+      # There are a number of possible approaches for
+      # this, but for now we simply ignore them. Other options include:
+      # - Use the QuickFix list to report project errors?
+      # - Use a special buffer for project errors
+      # - Put them in the location list of whatever the "current" buffer is
+      # - Store them in case the buffer is opened later
+      # - add a :YcmProjectDiags command
+      # - Add them to errror/warning _counts_ but not any actual location list
+      #   or other
+      # - etc.
+      #
+      # However, none of those options are great, and lead to their own
+      # complexities. So for now, we just ignore these diagnostics for files not
+      # open in any buffer.
+      pass
+
+
+  def OnPeriodicTick( self ):
     if not self.IsServerAlive():
-      self._NotifyUserIfServerCrashed()
+      # Server has died. We'll reset when the server is started again.
+      return False
+    elif not self.IsServerReady():
+      # Try again in a jiffy
+      return True
+
+    for w in vim.windows:
+      for filetype in vimsupport.FiletypesForBuffer( w.buffer ):
+        if filetype not in self._message_poll_requests:
+          self._message_poll_requests[ filetype ] = MessagesPoll( w.buffer )
+
+        # None means don't poll this filetype
+        if ( self._message_poll_requests[ filetype ] and
+             not self._message_poll_requests[ filetype ].Poll( self ) ):
+          self._message_poll_requests[ filetype ] = None
+
+    return any( self._message_poll_requests.values() )
+
+
+  def OnFileReadyToParse( self ):
+    if not self.IsServerAlive():
+      self.NotifyUserIfServerCrashed()
+      return
+
+    if not self.IsServerReady():
+      return
 
     extra_data = {}
     self._AddTagsFilesIfNeeded( extra_data )
     self._AddSyntaxDataIfNeeded( extra_data )
     self._AddExtraConfDataIfNeeded( extra_data )
 
-    self._latest_file_parse_request = EventNotification( 'FileReadyToParse',
-                                                          extra_data )
-    self._latest_file_parse_request.Start()
+    self.CurrentBuffer().SendParseRequest( extra_data )
 
 
-  def OnBufferUnload( self, deleted_buffer_file ):
-    if not self.IsServerAlive():
-      return
-    SendEventNotificationAsync( 'BufferUnload',
-                                { 'unloaded_buffer': deleted_buffer_file } )
+  def OnFileSave( self, saved_buffer_number ):
+    SendEventNotificationAsync( 'FileSave', saved_buffer_number )
+
+
+  def OnBufferUnload( self, deleted_buffer_number ):
+    SendEventNotificationAsync( 'BufferUnload', deleted_buffer_number )
+
+
+  def UpdateMatches( self ):
+    self.CurrentBuffer().UpdateMatches()
+
+
+  def OnFileTypeSet( self ):
+    buffer_number = vimsupport.GetCurrentBufferNumber()
+    filetypes = vimsupport.CurrentFiletypes()
+    self._buffers[ buffer_number ].UpdateFromFileTypes( filetypes )
+    self.OnBufferVisit()
 
 
   def OnBufferVisit( self ):
-    if not self.IsServerAlive():
-      return
+    for filetype in vimsupport.CurrentFiletypes():
+      # Send the signature help available request for these filetypes if we need
+      # to (as a side effect of checking if it is complete)
+      self.SignatureHelpAvailableRequestComplete( filetype, True )
+
     extra_data = {}
-    _AddUltiSnipsDataIfNeeded( extra_data )
-    SendEventNotificationAsync( 'BufferVisit', extra_data )
+    self._AddUltiSnipsDataIfNeeded( extra_data )
+    SendEventNotificationAsync( 'BufferVisit', extra_data = extra_data )
+
+
+  def CurrentBuffer( self ):
+    return self.Buffer( vimsupport.GetCurrentBufferNumber() )
+
+
+  def Buffer( self, bufnr ):
+    return self._buffers[ bufnr ]
+
+
+  def OnInsertEnter( self ):
+    if not self._user_options[ 'update_diagnostics_in_insert_mode' ]:
+      self.CurrentBuffer().ClearDiagnosticsUI()
 
 
   def OnInsertLeave( self ):
-    if not self.IsServerAlive():
-      return
+    async_diags = any( self._message_poll_requests.get( filetype )
+                      for filetype in vimsupport.CurrentFiletypes() )
+    if ( not self._user_options[ 'update_diagnostics_in_insert_mode' ] and
+         ( async_diags or not self.CurrentBuffer().ParseRequestPending() ) ):
+      self.CurrentBuffer().RefreshDiagnosticsUI()
     SendEventNotificationAsync( 'InsertLeave' )
 
 
   def OnCursorMoved( self ):
-    self._diag_interface.OnCursorMoved()
+    self.CurrentBuffer().OnCursorMoved()
+
+
+  def _CleanLogfile( self ):
+    logging.shutdown()
+    if not self._user_options[ 'keep_logfiles' ]:
+      if self._client_logfile:
+        utils.RemoveIfExists( self._client_logfile )
 
 
   def OnVimLeave( self ):
-    self._ServerCleanup()
+    self._ShutdownServer()
+    self._CleanLogfile()
 
 
   def OnCurrentIdentifierFinished( self ):
-    if not self.IsServerAlive():
-      return
     SendEventNotificationAsync( 'CurrentIdentifierFinished' )
 
 
   def OnCompleteDone( self ):
-    complete_done_actions = self.GetCompleteDoneHooks()
-    for action in complete_done_actions:
-      action(self)
+    completion_request = self.GetCurrentCompletionRequest()
+    if completion_request:
+      completion_request.OnCompleteDone()
 
 
-  def GetCompleteDoneHooks( self ):
-    filetypes = vimsupport.CurrentFiletypes()
-    for key, value in self._complete_done_hooks.iteritems():
-      if key in filetypes:
-        yield value
-
-
-  def GetCompletionsUserMayHaveCompleted( self ):
-    latest_completion_request = self.GetCurrentCompletionRequest()
-    if not latest_completion_request or not latest_completion_request.Done():
-      return []
-
-    completions = latest_completion_request.RawResponse()
-
-    result = self._FilterToMatchingCompletions( completions, True )
-    result = list( result )
-    if result:
-      return result
-
-    if self._HasCompletionsThatCouldBeCompletedWithMoreText( completions ):
-      # Since the way that YCM works leads to CompleteDone called on every
-      # character, return blank if the completion might not be done. This won't
-      # match if the completion is ended with typing a non-keyword character.
-      return []
-
-    result = self._FilterToMatchingCompletions( completions, False )
-
-    return list( result )
-
-
-  def _FilterToMatchingCompletions( self, completions, full_match_only ):
-    self._PatchBasedOnVimVersion()
-    return self._FilterToMatchingCompletions( completions, full_match_only)
-
-
-  def _HasCompletionsThatCouldBeCompletedWithMoreText( self, completions ):
-    self._PatchBasedOnVimVersion()
-    return self._HasCompletionsThatCouldBeCompletedWithMoreText( completions )
-
-
-  def _PatchBasedOnVimVersion( self ):
-    if vimsupport.VimVersionAtLeast( "7.4.774" ):
-      self._HasCompletionsThatCouldBeCompletedWithMoreText = \
-        self._HasCompletionsThatCouldBeCompletedWithMoreText_NewerVim
-      self._FilterToMatchingCompletions = \
-        self._FilterToMatchingCompletions_NewerVim
-    else:
-      self._FilterToMatchingCompletions = \
-        self._FilterToMatchingCompletions_OlderVim
-      self._HasCompletionsThatCouldBeCompletedWithMoreText = \
-        self._HasCompletionsThatCouldBeCompletedWithMoreText_OlderVim
-
-
-  def _FilterToMatchingCompletions_NewerVim( self, completions,
-                                             full_match_only ):
-    """ Filter to completions matching the item Vim said was completed """
-    completed = vimsupport.GetVariableValue( 'v:completed_item' )
-    for completion in completions:
-      item = ConvertCompletionDataToVimData( completion )
-      match_keys = ( [ "word", "abbr", "menu", "info" ] if full_match_only
-                      else [ 'word' ] )
-      matcher = lambda key: completed.get( key, "" ) == item.get( key, "" )
-      if all( [ matcher( i ) for i in match_keys ] ):
-        yield completion
-
-
-  def _FilterToMatchingCompletions_OlderVim( self, completions,
-                                             full_match_only ):
-    """ Filter to completions matching the buffer text """
-    if full_match_only:
-      return # Only supported in 7.4.774+
-    # No support for multiple line completions
-    text = vimsupport.TextBeforeCursor()
-    for completion in completions:
-      word = completion[ "insertion_text" ]
-      # Trim complete-ending character if needed
-      text = re.sub( r"[^a-zA-Z0-9_]$", "", text )
-      buffer_text = text[ -1 * len( word ) : ]
-      if buffer_text == word:
-        yield completion
-
-
-  def _HasCompletionsThatCouldBeCompletedWithMoreText_NewerVim( self,
-                                                                completions ):
-    completed_item = vimsupport.GetVariableValue( 'v:completed_item' )
-    completed_word = completed_item[ 'word' ]
-    if not completed_word:
+  def ResolveCompletionItem( self, item ):
+    # Note: As mentioned elsewhere, we replace the current completion request
+    # with a resolve request. It's not valid to have simultaneous resolve and
+    # completion requests, because the resolve request uses the request data
+    # from the last completion request and is therefore dependent on it not
+    # having changed.
+    #
+    # The result of this is that self.GetCurrentCompletionRequest() might return
+    # either a completion request of a resolve request and it's the
+    # responsibility of the vimscript code to ensure that it only does one at a
+    # time. This is handled by re-using the same poller for completions and
+    # resolves.
+    completion_request = self.GetCurrentCompletionRequest()
+    if not completion_request:
       return False
 
-    # Sometime CompleteDone is called after the next character is inserted
-    # If so, use inserted character to filter possible completions further
-    text = vimsupport.TextBeforeCursor()
-    reject_exact_match = True
-    if text and text[ -1 ] != completed_word[ -1 ]:
-      reject_exact_match = False
-      completed_word += text[ -1 ]
+    request  = ResolveCompletionItem( completion_request, item )
+    if not request:
+      return False
 
-    for completion in completions:
-      word = ConvertCompletionDataToVimData( completion )[ 'word' ]
-      if reject_exact_match and word == completed_word:
-        continue
-      if word.startswith( completed_word ):
-        return True
-    return False
+    self._latest_completion_request = request
+    return True
 
 
-  def _HasCompletionsThatCouldBeCompletedWithMoreText_OlderVim( self,
-                                                                completions ):
-    # No support for multiple line completions
-    text = vimsupport.TextBeforeCursor()
-    for completion in completions:
-      word = ConvertCompletionDataToVimData( completion )[ 'word' ]
-      for i in range( 1, len( word ) - 1 ): # Excluding full word
-        if text[ -1 * i  : ] == word[ : i ]:
-          return True
-    return False
+  def GetErrorCount( self ):
+    return self.CurrentBuffer().GetErrorCount()
 
 
+  def GetWarningCount( self ):
+    return self.CurrentBuffer().GetWarningCount()
 
-  def _OnCompleteDone_Csharp( self ):
-    completions = self.GetCompletionsUserMayHaveCompleted()
-    namespaces = [ self._GetRequiredNamespaceImport( c )
-                   for c in completions ]
-    namespaces = [ n for n in namespaces if n ]
-    if not namespaces:
+
+  def _PopulateLocationListWithLatestDiagnostics( self ):
+    return self.CurrentBuffer().PopulateLocationList(
+        self._user_options[ 'open_loclist_on_ycm_diags' ] )
+
+
+  def FileParseRequestReady( self ):
+    # Return True if server is not ready yet, to stop repeating check timer.
+    return ( not self.IsServerReady() or
+             self.CurrentBuffer().FileParseRequestReady() )
+
+
+  def HandleFileParseRequest( self, block = False ):
+    if not self.IsServerReady():
       return
 
-    if len( namespaces ) > 1:
-      choices = [ "{0} {1}".format( i + 1, n )
-                  for i,n in enumerate( namespaces ) ]
-      choice = vimsupport.PresentDialog( "Insert which namespace:", choices )
-      if choice < 0:
-        return
-      namespace = namespaces[ choice ]
-    else:
-      namespace = namespaces[ 0 ]
-
-    vimsupport.InsertNamespace( namespace )
-
-
-  def _GetRequiredNamespaceImport( self, completion ):
-    if ( "extra_data" not in completion
-         or "required_namespace_import" not in completion[ "extra_data" ] ):
-      return None
-    return completion[ "extra_data" ][ "required_namespace_import" ]
-
-
-  def DiagnosticsForCurrentFileReady( self ):
-    return bool( self._latest_file_parse_request and
-                 self._latest_file_parse_request.Done() )
-
-
-  def GetDiagnosticsFromStoredRequest( self, qflist_format = False ):
-    if self.DiagnosticsForCurrentFileReady():
-      diagnostics = self._latest_file_parse_request.Response()
-      # We set the diagnostics request to None because we want to prevent
-      # repeated refreshing of the buffer with the same diags. Setting this to
-      # None makes DiagnosticsForCurrentFileReady return False until the next
-      # request is created.
-      self._latest_file_parse_request = None
-      if qflist_format:
-        return vimsupport.ConvertDiagnosticsToQfList( diagnostics )
-      else:
-        return diagnostics
-    return []
-
-
-  def UpdateDiagnosticInterface( self ):
-    if ( self.DiagnosticsForCurrentFileReady() and
+    current_buffer = self.CurrentBuffer()
+    # Order is important here:
+    # FileParseRequestReady has a low cost, while
+    # NativeFiletypeCompletionUsable is a blocking server request
+    if ( not current_buffer.IsResponseHandled() and
+         current_buffer.FileParseRequestReady( block ) and
          self.NativeFiletypeCompletionUsable() ):
-      self._diag_interface.UpdateWithNewDiagnostics(
-        self.GetDiagnosticsFromStoredRequest() )
+
+      if self._user_options[ 'show_diagnostics_ui' ]:
+        # Forcefuly update the location list, etc. from the parse request when
+        # doing something like :YcmDiags
+        async_diags = any( self._message_poll_requests.get( filetype )
+                           for filetype in vimsupport.CurrentFiletypes() )
+        current_buffer.UpdateDiagnostics( block or not async_diags )
+      else:
+        # If the user disabled diagnostics, we just want to check
+        # the _latest_file_parse_request for any exception or UnknownExtraConf
+        # response, to allow the server to raise configuration warnings, etc.
+        # to the user. We ignore any other supplied data.
+        current_buffer.GetResponse()
+
+      # We set the file parse request as handled because we want to prevent
+      # repeated issuing of the same warnings/errors/prompts. Setting this
+      # makes IsRequestHandled return True until the next request is created.
+      #
+      # Note: it is the server's responsibility to determine the frequency of
+      # error/warning/prompts when receiving a FileReadyToParse event, but
+      # it is our responsibility to ensure that we only apply the
+      # warning/error/prompt received once (for each event).
+      current_buffer.MarkResponseHandled()
 
 
-  def ShowDetailedDiagnostic( self ):
-    if not self.IsServerAlive():
-      return
-    try:
-      debug_info = BaseRequest.PostDataToHandler( BuildRequestData(),
-                                                  'detailed_diagnostic' )
-      if 'message' in debug_info:
-        vimsupport.EchoText( debug_info[ 'message' ] )
-    except ServerError as e:
-      vimsupport.PostVimMessage( str( e ) )
+  def ShouldResendFileParseRequest( self ):
+    return self.CurrentBuffer().ShouldResendParseRequest()
 
 
   def DebugInfo( self ):
-    if self.IsServerAlive():
-      debug_info = BaseRequest.PostDataToHandler( BuildRequestData(),
-                                                  'debug_info' )
-    else:
-      debug_info = 'Server crashed, no debug info from server'
-    debug_info += '\nServer running at: {0}'.format(
-        BaseRequest.server_location )
-    debug_info += '\nServer process ID: {0}'.format( self._server_popen.pid )
-    if self._server_stderr or self._server_stdout:
-      debug_info += '\nServer logfiles:\n  {0}\n  {1}'.format(
-        self._server_stdout,
-        self._server_stderr )
-
+    debug_info = ''
+    if self._client_logfile:
+      debug_info += f'Client logfile: { self._client_logfile }\n'
+    extra_data = {}
+    self._AddExtraConfDataIfNeeded( extra_data )
+    debug_info += FormatDebugInfoResponse( SendDebugInfoRequest( extra_data ) )
+    debug_info += f'Server running at: { BaseRequest.server_location }\n'
+    if self._server_popen:
+      debug_info += f'Server process ID: { self._server_popen.pid }\n'
+    if self._server_stdout and self._server_stderr:
+      debug_info += ( 'Server logfiles:\n'
+                      f'  { self._server_stdout }\n'
+                      f'  { self._server_stderr }' )
+    debug_info += ( '\nSemantic highlighting supported: ' +
+                    str( not vimsupport.VimIsNeovim() ) )
+    debug_info += ( '\nVirtual text supported: ' +
+                    str( vimsupport.VimSupportsVirtualText() ) )
+    debug_info += ( '\nPopup windows supported: ' +
+                    str( vimsupport.VimSupportsPopupWindows() ) )
     return debug_info
 
 
-  def CurrentFiletypeCompletionEnabled( self ):
-    filetypes = vimsupport.CurrentFiletypes()
-    filetype_to_disable = self._user_options[
-      'filetype_specific_completion_to_disable' ]
-    if '*' in filetype_to_disable:
+  def GetLogfiles( self ):
+    logfiles_list = [ self._client_logfile,
+                      self._server_stdout,
+                      self._server_stderr ]
+
+    extra_data = {}
+    self._AddExtraConfDataIfNeeded( extra_data )
+    debug_info = SendDebugInfoRequest( extra_data )
+    if debug_info:
+      completer = debug_info[ 'completer' ]
+      if completer:
+        for server in completer[ 'servers' ]:
+          logfiles_list.extend( server[ 'logfiles' ] )
+
+    logfiles = {}
+    for logfile in logfiles_list:
+      logfiles[ os.path.basename( logfile ) ] = logfile
+    return logfiles
+
+
+  def _OpenLogfile( self, size, mods, logfile ):
+    # Open log files in a horizontal window with the same behavior as the
+    # preview window (same height and winfixheight enabled). Automatically
+    # watch for changes. Set the cursor position at the end of the file.
+    if not size:
+      size = vimsupport.GetIntValue( '&previewheight' )
+
+    options = {
+      'size': size,
+      'fix': True,
+      'focus': False,
+      'watch': True,
+      'position': 'end',
+      'mods': mods
+    }
+
+    vimsupport.OpenFilename( logfile, options )
+
+
+  def _CloseLogfile( self, logfile ):
+    vimsupport.CloseBuffersForFilename( logfile )
+
+
+  def ToggleLogs( self, size, mods, *filenames ):
+    logfiles = self.GetLogfiles()
+    if not filenames:
+      sorted_logfiles = sorted( logfiles )
+      try:
+        logfile_index = vimsupport.SelectFromList(
+          'Which logfile do you wish to open (or close if already open)?',
+          sorted_logfiles )
+      except RuntimeError as e:
+        vimsupport.PostVimMessage( str( e ) )
+        return
+
+      logfile = logfiles[ sorted_logfiles[ logfile_index ] ]
+      if not vimsupport.BufferIsVisibleForFilename( logfile ):
+        self._OpenLogfile( size, mods, logfile )
+      else:
+        self._CloseLogfile( logfile )
+      return
+
+    for filename in set( filenames ):
+      if filename not in logfiles:
+        continue
+
+      logfile = logfiles[ filename ]
+
+      if not vimsupport.BufferIsVisibleForFilename( logfile ):
+        self._OpenLogfile( size, mods, logfile )
+        continue
+
+      self._CloseLogfile( logfile )
+
+
+  def ShowDetailedDiagnostic( self, message_in_popup ):
+    detailed_diagnostic = BaseRequest().PostDataToHandler(
+        BuildRequestData(), 'detailed_diagnostic' )
+    if detailed_diagnostic and 'message' in detailed_diagnostic:
+      message = detailed_diagnostic[ 'message' ]
+      if message_in_popup and vimsupport.VimSupportsPopupWindows():
+        window = vim.current.window
+        buffer_number = vimsupport.GetCurrentBufferNumber()
+        diags_on_this_line = self._buffers[ buffer_number ].DiagnosticsForLine(
+            window.cursor[ 0 ] )
+
+        lines = message.split( '\n' )
+        available_columns = vimsupport.GetIntValue( '&columns' )
+        col = window.cursor[ 1 ] + 1
+        if col > available_columns - 2: # -2 accounts for padding.
+          col = 0
+        options = {
+          'col': col,
+          'padding': [ 0, 1, 0, 1 ],
+          'maxwidth': available_columns,
+          'close': 'click',
+          'fixed': 0,
+          'highlight': 'YcmErrorPopup',
+          'border': [ 1, 1, 1, 1 ],
+          # Close when moving cursor
+          'moved': 'expr',
+        }
+        popup_func = 'popup_atcursor'
+        for diag in diags_on_this_line:
+          if message == diag[ 'text' ]:
+            popup_func = 'popup_create'
+            prop = vimsupport.GetTextPropertyForDiag( buffer_number,
+                                                      window.cursor[ 0 ],
+                                                      diag )
+            options.update( {
+              'textpropid': prop[ 'id' ],
+              'textprop': prop[ 'type' ],
+            } )
+            options.pop( 'col' )
+            break
+        vim.eval( f'{ popup_func }( { json.dumps( lines ) }, '
+                                  f'{ json.dumps( options ) } )' )
+      else:
+        vimsupport.PostVimMessage( message, warning = False )
+
+
+  def ForceCompileAndDiagnostics( self ):
+    if not self.NativeFiletypeCompletionUsable():
+      vimsupport.PostVimMessage(
+          'Native filetype completion not supported for current file, '
+          'cannot force recompilation.', warning = False )
       return False
-    else:
-      return not any([ x in filetype_to_disable for x in filetypes ])
+    vimsupport.PostVimMessage(
+        'Forcing compilation, this will block Vim until done.',
+        warning = False )
+    self.OnFileReadyToParse()
+    self.HandleFileParseRequest( block = True )
+    vimsupport.PostVimMessage( 'Diagnostics refreshed', warning = False )
+    return True
+
+
+  def ShowDiagnostics( self ):
+    if not self.ForceCompileAndDiagnostics():
+      return
+
+    if not self._PopulateLocationListWithLatestDiagnostics():
+      vimsupport.PostVimMessage( 'No warnings or errors detected.',
+                                 warning = False )
+      return
+
+    if self._user_options[ 'open_loclist_on_ycm_diags' ]:
+      vimsupport.OpenLocationList( focus = True )
+
+
+  def FilterAndSortItems( self,
+                          items,
+                          sort_property,
+                          query,
+                          max_items = 0 ):
+    return BaseRequest().PostDataToHandler( {
+      'candidates': items,
+      'sort_property': sort_property,
+      'max_num_candidates': max_items,
+      'query': vimsupport.ToUnicode( query )
+    }, 'filter_and_sort_candidates' )
+
+
+  def ToggleSignatureHelp( self ):
+    self._signature_help_state.ToggleVisibility()
 
 
   def _AddSyntaxDataIfNeeded( self, extra_data ):
@@ -525,7 +927,8 @@ class YouCompleteMe( object ):
     if filetype in self._filetypes_with_keywords_loaded:
       return
 
-    self._filetypes_with_keywords_loaded.add( filetype )
+    if self.IsServerReady():
+      self._filetypes_with_keywords_loaded.add( filetype )
     extra_data[ 'syntax_keywords' ] = list(
        syntax_parse.SyntaxKeywordsForCurrentBuffer() )
 
@@ -533,12 +936,9 @@ class YouCompleteMe( object ):
   def _AddTagsFilesIfNeeded( self, extra_data ):
     def GetTagFiles():
       tag_files = vim.eval( 'tagfiles()' )
-      # getcwd() throws an exception when the CWD has been deleted.
-      try:
-        current_working_directory = os.getcwd()
-      except OSError:
-        return []
-      return [ os.path.join( current_working_directory, x ) for x in tag_files ]
+      return [ ( os.path.join( utils.GetCurrentDirectory(), tag_file )
+                 if not os.path.isabs( tag_file ) else tag_file )
+               for tag_file in tag_files ]
 
     if not self._user_options[ 'collect_identifiers_from_tags_files' ]:
       return
@@ -547,8 +947,17 @@ class YouCompleteMe( object ):
 
   def _AddExtraConfDataIfNeeded( self, extra_data ):
     def BuildExtraConfData( extra_conf_vim_data ):
-      return dict( ( expr, vimsupport.VimExpressionToPythonType( expr ) )
-                   for expr in extra_conf_vim_data )
+      extra_conf_data = {}
+      for expr in extra_conf_vim_data:
+        try:
+          extra_conf_data[ expr ] = vimsupport.VimExpressionToPythonType( expr )
+        except vim.error:
+          message = (
+            f"Error evaluating '{ expr }' in the 'g:ycm_extra_conf_vim_data' "
+            "option." )
+          vimsupport.PostVimMessage( message, truncate = True )
+          self._logger.exception( message )
+      return extra_conf_data
 
     extra_conf_vim_data = self._user_options[ 'extra_conf_vim_data' ]
     if extra_conf_vim_data:
@@ -556,23 +965,16 @@ class YouCompleteMe( object ):
         extra_conf_vim_data )
 
 
-def _PathToServerScript():
-  dir_of_current_script = os.path.dirname( os.path.abspath( __file__ ) )
-  return os.path.join( dir_of_current_script, '../../third_party/ycmd/ycmd' )
+  def _AddUltiSnipsDataIfNeeded( self, extra_data ):
+    # See :h UltiSnips#SnippetsInCurrentScope.
+    try:
+      vim.eval( 'UltiSnips#SnippetsInCurrentScope( 1 )' )
+    except vim.error:
+      return
 
-
-def _AddUltiSnipsDataIfNeeded( extra_data ):
-  if not USE_ULTISNIPS_DATA:
-    return
-
-  try:
-    rawsnips = UltiSnips_Manager._snips( '', 1 )
-  except:
-    return
-
-  # UltiSnips_Manager._snips() returns a class instance where:
-  # class.trigger - name of snippet trigger word ( e.g. defn or testcase )
-  # class.description - description of the snippet
-  extra_data[ 'ultisnips_snippets' ] = [ { 'trigger': x.trigger,
-                                           'description': x.description
-                                         } for x in rawsnips ]
+    snippets = vimsupport.GetVariableValue( 'g:current_ulti_dict_info' )
+    extra_data[ 'ultisnips_snippets' ] = [
+      { 'trigger': trigger,
+        'description': snippet[ 'description' ] }
+      for trigger, snippet in snippets.items()
+    ]
